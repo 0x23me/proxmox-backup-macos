@@ -68,6 +68,7 @@ impl UploadCounters {
 
     #[inline(always)]
     pub(crate) fn add_known_chunk(&mut self, chunk_len: usize) -> usize {
+        crate::report::processed(chunk_len, true);
         self.known_chunk_count.fetch_add(1, Ordering::SeqCst);
         self.total_chunk_count.fetch_add(1, Ordering::SeqCst);
         self.reused_stream_len
@@ -77,6 +78,7 @@ impl UploadCounters {
 
     #[inline(always)]
     pub(crate) fn add_new_chunk(&mut self, chunk_len: usize, chunk_raw_size: u64) -> usize {
+        crate::report::processed(chunk_len, false);
         self.total_chunk_count.fetch_add(1, Ordering::SeqCst);
         self.compressed_stream_len
             .fetch_add(chunk_raw_size, Ordering::SeqCst);
@@ -85,6 +87,7 @@ impl UploadCounters {
 
     #[inline(always)]
     pub(crate) fn add_injected_chunk(&mut self, chunk: &ReusableDynamicEntry) -> usize {
+        crate::report::processed(chunk.size() as usize, true);
         self.total_chunk_count.fetch_add(1, Ordering::SeqCst);
         self.injected_chunk_count.fetch_add(1, Ordering::SeqCst);
 

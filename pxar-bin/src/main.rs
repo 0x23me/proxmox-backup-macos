@@ -381,6 +381,8 @@ async fn create_archive(
         patterns,
         skip_lost_and_found: false,
         skip_e2big_xattr: false,
+        skip_placeholders: false,
+        skip_tm_excluded: false,
         previous_ref: None,
         max_cache_size: None,
     };

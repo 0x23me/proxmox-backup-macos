@@ -5,6 +5,7 @@
 
 pub mod catalog_shell;
 pub mod pxar;
+pub mod report;
 pub mod tools;
 
 mod inject_reused_chunks;

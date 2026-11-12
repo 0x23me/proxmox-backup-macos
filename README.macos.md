@@ -88,6 +88,23 @@ proxmox-backup-client catalog extract <snapshot> documents.pxar <path> /restore 
 `mtime` is in seconds since the epoch. `restore --pattern` gives the same result as
 `catalog extract` but reads the whole archive to get there.
 
+Three options of `backup` also exist only here:
+
+- `--skip-placeholders true` leaves out files whose contents are not on disk (evicted iCloud
+  and File Provider files) and reports them, instead of failing the backup. Nothing is
+  downloaded.
+- `--skip-tm-excluded true` leaves out every entry that carries the Time Machine exclusion
+  attribute (`com.apple.metadata:com_apple_backup_excludeItem`, set by `tmutil addexclusion`
+  and by applications on caches and build folders), with everything below it.
+- `--progress-json true` (also on `restore`) prints one JSON object per line on standard
+  output while the log stays on standard error: a `progress` record every second with
+  `entries`, `bytes_processed`, `bytes_uploaded`, `path` and `elapsed`, and one final `result`
+  record with `ok`, the `snapshot` and `namespace`, `entries`, `bytes_processed`,
+  `bytes_reused`, `bytes_uploaded`, `skipped_placeholders` (at most 1000 paths) with
+  `skipped_placeholder_count`, `time_machine_excluded`, `warnings` and `duration`. On failure
+  the record has `"ok": false` and the exit status is non-zero. The format is described in
+  full at the top of `pbs-client/src/report.rs`.
+
 The CLI retains the Linux syntax, for example:
 
 ```sh

@@ -44,6 +44,10 @@ use crate::pxar::tools::assert_single_path_component;
 
 const CHUNK_PADDING_THRESHOLD: f64 = 0.1;
 
+/// Set by `tmutil addexclusion` and by applications on what Time Machine should leave out.
+#[cfg(target_os = "macos")]
+const TIME_MACHINE_EXCLUDED: &CStr = c"com.apple.metadata:com_apple_backup_excludeItem";
+
 /// Pxar options for creating a pxar archive/stream
 #[derive(Default)]
 pub struct PxarCreateOptions {
@@ -57,6 +61,12 @@ pub struct PxarCreateOptions {
     pub skip_lost_and_found: bool,
     /// Skip xattrs of files that return E2BIG error
     pub skip_e2big_xattr: bool,
+    /// Leave out files whose contents are not on disk (iCloud and File Provider placeholders)
+    /// and report them, instead of failing. macOS only.
+    pub skip_placeholders: bool,
+    /// Leave out entries that carry the Time Machine exclusion attribute, with everything
+    /// below them, and count them. macOS only.
+    pub skip_tm_excluded: bool,
     /// Reference state for partial backups
     pub previous_ref: Option<PxarPrevRef>,
     /// Maximum number of lookahead cache entries
@@ -201,6 +211,10 @@ struct Archiver {
     hardlinks: HashMap<HardLinkInfo, (PathBuf, LinkOffset)>,
     file_copy_buffer: Vec<u8>,
     skip_e2big_xattr: bool,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    skip_placeholders: bool,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    skip_tm_excluded: bool,
     forced_boundaries: Option<mpsc::Sender<InjectChunks>>,
     suggested_boundaries: Option<mpsc::Sender<u64>>,
     previous_payload_index: Option<DynamicIndexReader>,
@@ -321,6 +335,8 @@ where
         hardlinks: HashMap::new(),
         file_copy_buffer: vec::undefined(4 * 1024 * 1024),
         skip_e2big_xattr: options.skip_e2big_xattr,
+        skip_placeholders: options.skip_placeholders,
+        skip_tm_excluded: options.skip_tm_excluded,
         forced_boundaries,
         suggested_boundaries,
         previous_payload_index,
@@ -823,6 +839,11 @@ impl Archiver {
         }
         #[cfg(target_os = "macos")]
         if stat.st_flags & 0x40000000 != 0 {
+            if self.skip_placeholders {
+                info!("skipping placeholder, its contents are not on disk: {:?}", self.path);
+                crate::report::skipped_placeholder(&self.path);
+                return Ok(());
+            }
             bail!(
                 "dataless file must be downloaded before backup: {:?}",
                 self.path
@@ -859,6 +880,14 @@ impl Archiver {
             Some(fd) => fd,
             None => return Ok(()),
         };
+
+        #[cfg(target_os = "macos")]
+        if self.skip_tm_excluded && xattr::fgetxattr(fd.as_raw_fd(), TIME_MACHINE_EXCLUDED).is_ok() {
+            info!("skipping, excluded from Time Machine: {:?}", self.path);
+            crate::report::excluded_by_time_machine();
+            return Ok(());
+        }
+        crate::report::entry(&self.path);
 
         #[cfg(target_os = "macos")]
         if file_mode == libc::S_IFLNK {
@@ -2242,6 +2271,8 @@ mod tests {
                 hardlinks: HashMap::new(),
                 file_copy_buffer: vec::undefined(4 * 1024 * 1024),
                 skip_e2big_xattr: false,
+                skip_placeholders: false,
+                skip_tm_excluded: false,
                 forced_boundaries: Some(forced_boundaries),
                 previous_payload_index,
                 suggested_boundaries: Some(suggested_boundaries),

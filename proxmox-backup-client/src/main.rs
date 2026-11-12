@@ -790,6 +790,24 @@ fn spawn_catalog_upload(
                 optional: true,
                 default: false,
             },
+            "skip-placeholders": {
+                type: Boolean,
+                description: "Leave out files whose contents are not on disk (iCloud and File Provider placeholders) and report them, instead of failing. macOS only.",
+                optional: true,
+                default: false,
+            },
+            "skip-tm-excluded": {
+                type: Boolean,
+                description: "Leave out entries that carry the Time Machine exclusion attribute, with everything below them. macOS only.",
+                optional: true,
+                default: false,
+            },
+            "progress-json": {
+                type: Boolean,
+                description: "Print progress and result records as JSON lines on standard output.",
+                optional: true,
+                default: false,
+            },
             "no-cache": {
                 type: Boolean,
                 description: "Bypass local datastore cache for network storages.",
@@ -808,6 +826,9 @@ async fn create_backup(
     change_detection_mode: Option<BackupDetectionMode>,
     dry_run: bool,
     skip_e2big_xattr: bool,
+    skip_placeholders: bool,
+    skip_tm_excluded: bool,
+    progress_json: bool,
     no_cache: bool,
     limit: ClientRateLimitConfig,
     _info: &ApiMethod,
@@ -1003,6 +1024,7 @@ async fn create_backup(
 
     log::info!("Client name: {}", proxmox_sys::nodename());
 
+    let _report = progress_json.then(pbs_client::report::start);
     let start_time = std::time::Instant::now();
 
     log::info!(
@@ -1258,6 +1280,8 @@ async fn create_backup(
                     entries_max: entries_max as usize,
                     skip_lost_and_found,
                     skip_e2big_xattr,
+                    skip_placeholders,
+                    skip_tm_excluded,
                     previous_ref,
                     max_cache_size,
                     #[cfg(target_os = "macos")]
@@ -1321,6 +1345,7 @@ async fn create_backup(
 
     if dry_run {
         log::info!("dry-run: no upload happened");
+        pbs_client::report::finish(None, None);
         return Ok(Value::Null);
     }
 
@@ -1439,6 +1464,7 @@ async fn create_backup(
     let elapsed = end_time.duration_since(start_time);
     log::info!("Duration: {:.2}s", elapsed.as_secs_f64());
     log::info!("End Time: {}", strftime_local("%c", epoch_i64())?);
+    pbs_client::report::finish(Some((snapshot.to_string(), backup_ns.to_string())), None);
     Ok(Value::Null)
 }
 
@@ -1576,6 +1602,7 @@ impl<R: Read> Read for CountingReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let count = self.inner.read(buf)?;
         self.progress.lock().unwrap().add(count as u64);
+        pbs_client::report::processed(count, false);
         Ok(count)
     }
 }
@@ -1798,6 +1825,12 @@ We do not extract '.pxar' archives when writing to standard output.
                 optional: true,
                 default: false,
             },
+            "progress-json": {
+                type: Boolean,
+                description: "Print progress and result records as JSON lines on standard output.",
+                optional: true,
+                default: false,
+            },
             "prelude-target": {
                 description: "Path to restore prelude to, (pxar v2 archives only).",
                 type: String,
@@ -1822,6 +1855,11 @@ async fn restore(
     limit: ClientRateLimitConfig,
     ignore_extract_device_errors: bool,
 ) -> Result<Value, Error> {
+    let _report = param["progress-json"]
+        .as_bool()
+        .unwrap_or(false)
+        .then(pbs_client::report::start);
+
     let repo = extract_repository_from_value(&param)?;
 
     let archive_name: BackupArchiveName =
@@ -1910,6 +1948,7 @@ async fn restore(
                 .map_err(|err| format_err!("unable to pipe data - {}", err))?;
         }
 
+        pbs_client::report::finish(None, None);
         return Ok(Value::Null);
     }
 
@@ -2038,6 +2077,7 @@ async fn restore(
                     feature_flags,
                     |path| {
                         log::debug!("{:?}", path);
+                        pbs_client::report::entry(path);
                     },
                     options,
                 )
@@ -2090,6 +2130,7 @@ async fn restore(
         .await?;
     }
 
+    pbs_client::report::finish(None, None);
     Ok(Value::Null)
 }
 

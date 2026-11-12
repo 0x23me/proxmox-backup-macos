@@ -13,6 +13,12 @@ What is tested:
   catalog extract    one folder and one file, each into an empty target, with their metadata
   change detection   a second run over an unchanged tree in which every file carries an
                      extended attribute reuses everything and uploads no file data
+  progress records   --progress-json prints a record at least every two seconds and a final
+                     record that names the snapshot the server then lists
+  exclusions         --skip-tm-excluded leaves out what carries the Time Machine exclusion
+                     attribute, with everything below it, and counts it
+  placeholders       --skip-placeholders leaves out files whose contents are not on disk and
+                     names them; without it the backup fails (needs PBS_TEST_PLACEHOLDER_DIR)
 
 Environment:
   PBS_REPOSITORY             as for the client (required)
@@ -20,6 +26,8 @@ Environment:
   PBS_TEST_KEYCHAIN_SERVICE  name of a login Keychain item holding the token secret
   PBS_TEST_NS                namespace to write to (required); the token needs DatastoreBackup there
   PBS_TEST_CLIENT            client binary (default native-target/release/proxmox-backup-client)
+  PBS_TEST_PLACEHOLDER_DIR   optional folder that holds at least one evicted iCloud or File
+                             Provider file; without it the placeholder test is skipped
   PBS_TEST_LARGE             optional "<snapshot> <archive>" of an existing big snapshot that
                              the key in PBS_TEST_LARGE_KEYFILE opens; its root must list within
                              five seconds
@@ -427,11 +435,13 @@ class Server:
         self.keyfile = os.path.join(work, "test.key")
         self.run("key", "create", self.keyfile, "--kdf", "none", scoped=False)
 
-    def run(self, *args, scoped=True, keyfile=None, ok=True):
+    def run(self, *args, scoped=True, key=True, keyfile=None, ok=True):
         """Runs the client; returns (status, standard output, standard error)."""
         command = [self.client, *args]
         if scoped:
-            command += ["--ns", self.ns, "--keyfile", keyfile or self.keyfile]
+            command += ["--ns", self.ns]
+        if scoped and key:
+            command += ["--keyfile", keyfile or self.keyfile]
         done = subprocess.run(command, env=self.env, capture_output=True, text=True)
         if ok and done.returncode != 0:
             raise Failed(f"{' '.join(args[:2])} exited {done.returncode}: {done.stderr.strip()[-400:]}")
@@ -442,6 +452,7 @@ class Server:
         time.sleep(1.1)   # snapshot names have a resolution of one second
         _, out, err = self.run("backup", f"{archive}:{folder}", "--backup-id", backup_id,
                                "--crypt-mode", "encrypt", *options)
+        self.records = [json.loads(line) for line in out.splitlines() if line.startswith("{")]
         log = out + err
         for line in log.splitlines():
             if line.startswith("Starting backup: "):
@@ -539,16 +550,107 @@ def test_change_detection(server, work, state):
     return f"40 of 40 files with attributes reused, {uploaded} of padding uploaded"
 
 
+def test_progress_records(server, work, state):
+    tree = os.path.join(work, "slow")
+    os.makedirs(tree)
+    for number in range(8):
+        write(os.path.join(tree, f"blob-{number}"), os.urandom(1_000_000))
+    # Slowed down so that the upload takes a few seconds.
+    snapshot, _ = server.backup("pbs-client-test-progress", "slow.pxar", tree,
+                                "--progress-json", "true", "--rate", "2MiB", "--burst", "2MiB")
+    progress = [record for record in server.records if record["type"] == "progress"]
+    results = [record for record in server.records if record["type"] == "result"]
+    check(len(results) == 1 and server.records[-1] is results[0], "no single result record at the end")
+    result = results[0]
+    check(len(progress) >= 2, f"only {len(progress)} progress records in {result['duration']} s")
+    times = [0.0] + [record["elapsed"] for record in progress] + [result["duration"]]
+    gap = max(later - earlier for earlier, later in zip(times, times[1:]))
+    check(gap <= 2.0, f"{gap:.1f} s without a record")
+    check(all({"entries", "bytes_processed", "bytes_uploaded", "path"} <= set(record) for record in progress),
+          "a progress record lacks a field")
+    check(any(record["path"].lstrip("/").startswith("blob-") for record in progress),
+          f"no progress record names a file: {[record['path'] for record in progress]}")
+    check(result["ok"] is True and result["snapshot"] == snapshot and result["namespace"] == server.ns,
+          f"result names {result.get('snapshot')} in {result.get('namespace')}, backup wrote {snapshot}")
+    check(result["entries"] == 8, f"result counts {result['entries']} entries")
+    check(result["bytes_processed"] >= 8_000_000 and result["bytes_uploaded"] >= 8_000_000,
+          f"result counts {result['bytes_processed']} processed, {result['bytes_uploaded']} uploaded")
+    check(result["skipped_placeholder_count"] == 0 and result["time_machine_excluded"] == 0,
+          "result reports skipped items in a plain tree")
+
+    _, out, _ = server.run("snapshot", "list", "host/pbs-client-test-progress",
+                           "--output-format", "json", key=False)
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(max(s["backup-time"] for s in json.loads(out))))
+    check(snapshot.endswith("/" + stamp), f"server's newest snapshot is {stamp}, result says {snapshot}")
+
+    status, out, _ = server.run("backup", f"gone.pxar:{tree}-missing", "--backup-id",
+                                "pbs-client-test-progress", "--progress-json", "true", ok=False)
+    check(status != 0, "a backup of a missing folder exited 0")
+    return f"{len(progress)} progress records, longest gap {gap:.1f} s, result matches the server"
+
+
+def test_time_machine_exclusions(server, work, state):
+    tree = os.path.join(work, "excluding")
+    os.makedirs(os.path.join(tree, "build", "sub"))
+    os.makedirs(os.path.join(tree, "other"))
+    for name in ("keep.txt", "cache.bin", "build/a", "build/sub/b", "other/keep-too.txt"):
+        write(os.path.join(tree, name), b"x" * 2000)
+    marker = plistlib.dumps("com.apple.backupd", fmt=plistlib.FMT_BINARY)
+    for name in ("build", "cache.bin"):
+        set_xattr(os.path.join(tree, name), "com.apple.metadata:com_apple_backup_excludeItem", marker)
+
+    snapshot, _ = server.backup("pbs-client-test-exclude", "tree.pxar", tree,
+                                "--skip-tm-excluded", "true", "--progress-json", "true")
+    result = server.records[-1]
+    check(result["time_machine_excluded"] == 2, f"result counts {result['time_machine_excluded']} excluded")
+    _, root, _ = server.listing(snapshot, "tree.pxar")
+    check({entry["name"] for entry in root} == {"keep.txt", "other"},
+          f"snapshot root holds {[entry['name'] for entry in root]}")
+
+    snapshot, _ = server.backup("pbs-client-test-exclude", "tree.pxar", tree)
+    _, root, _ = server.listing(snapshot, "tree.pxar")
+    check({entry["name"] for entry in root} == {"keep.txt", "other", "build", "cache.bin"},
+          "without the option the marked entries are missing too")
+    return "a marked folder with its contents and a marked file left out and counted as 2"
+
+
+def test_placeholders(server, work, state):
+    folder = server.env.get("PBS_TEST_PLACEHOLDER_DIR")
+    if not folder:
+        return "SKIPPED, no PBS_TEST_PLACEHOLDER_DIR"
+    folder = os.path.expanduser(folder)
+    dataless = [name for name in os.listdir(folder)
+                if os.lstat(os.path.join(folder, name)).st_flags & 0x40000000]
+    check(dataless, f"{folder} holds no placeholder")
+    snapshot, _ = server.backup("pbs-client-test-placeholder", "cloud.pxar", folder,
+                                "--skip-placeholders", "true", "--progress-json", "true")
+    result = server.records[-1]
+    check(result["ok"] and result["skipped_placeholder_count"] >= len(dataless),
+          f"result counts {result['skipped_placeholder_count']} placeholders, the folder has {len(dataless)}")
+    check(all(any(path.endswith(name) for path in result["skipped_placeholders"]) for name in dataless),
+          f"result names {result['skipped_placeholders']}, expected {dataless}")
+    _, root, _ = server.listing(snapshot, "cloud.pxar")
+    check(not {entry["name"] for entry in root} & set(dataless), "a placeholder is in the snapshot")
+    still = [name for name in dataless if os.lstat(os.path.join(folder, name)).st_flags & 0x40000000]
+    check(still == dataless, "the backup downloaded a placeholder")
+    status, _, err = server.run("backup", f"cloud.pxar:{folder}", "--backup-id",
+                                "pbs-client-test-placeholder", "--crypt-mode", "encrypt", ok=False)
+    check(status != 0 and "dataless" in err, "without the option the backup did not fail on the placeholder")
+    return f"{len(dataless)} placeholder(s) left out, named, not downloaded"
+
+
 def run_all():
     work = tempfile.mkdtemp(prefix="pbs-client-test-")
     failed = 0
     try:
         server = Server(work)
         state = {}
-        for test in (test_round_trip, test_catalog_list, test_catalog_extract, test_change_detection):
+        for test in (test_round_trip, test_catalog_list, test_catalog_extract, test_change_detection,
+                     test_progress_records, test_time_machine_exclusions, test_placeholders):
             name = test.__name__[5:].replace("_", " ")
             try:
-                print(f"ok    {name}: {test(server, work, state)}")
+                outcome = test(server, work, state)
+                print(f"{'skip ' if outcome.startswith('SKIPPED') else 'ok   '} {name}: {outcome}")
             except (Failed, KeyError, OSError, subprocess.CalledProcessError) as error:
                 failed += 1
                 print(f"FAIL  {name}: {error}")

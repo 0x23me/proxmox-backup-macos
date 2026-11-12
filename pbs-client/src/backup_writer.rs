@@ -610,6 +610,7 @@ impl BackupWriter {
                                         move |_result| {
                                             // account for uploaded bytes for progress output
                                             uploaded.fetch_add(response.size, Ordering::SeqCst);
+                                            crate::report::uploaded(response.size);
                                             future::ok(MergedChunkInfo::Known(list))
                                         }
                                     })
