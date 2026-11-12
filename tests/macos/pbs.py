@@ -760,6 +760,8 @@ def test_progress_records(server, work, state):
     times = [0.0] + [record["elapsed"] for record in progress] + [result["duration"]]
     gap = max(later - earlier for earlier, later in zip(times, times[1:]))
     check(gap <= 2.0, f"{gap:.1f} s without a record")
+    sent = [record.get("bytes_sent", -1) for record in progress] + [result.get("bytes_sent", -1)]
+    check(sent == sorted(sent) and sent[0] >= 0 and sent[-1] > 0, f"bytes sent over the network go {sent}")
     check(all({"entries", "bytes_processed", "bytes_uploaded", "path"} <= set(record) for record in progress),
           "a progress record lacks a field")
     check(any(record["path"].lstrip("/").startswith("blob-") for record in progress),

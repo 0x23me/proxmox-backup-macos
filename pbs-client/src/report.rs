@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! {"type":"progress","entries":1291,"bytes_processed":46254325760,"bytes_uploaded":44651675648,
-//!  "path":"Projects/report.pdf","elapsed":12.0}
+//!  "bytes_sent":34201638912,"path":"Projects/report.pdf","elapsed":12.0}
 //! {"type":"result","ok":true,"snapshot":"host/mac/2026-11-12T08:00:00Z","namespace":"laptops",
 //!  "entries":1474,"bytes_processed":46254325760,"bytes_reused":46254325728,"bytes_uploaded":32,
 //!  "skipped_placeholders":["iCloud/draft.pages"],"skipped_placeholder_count":1,
@@ -15,8 +15,9 @@
 //! A progress record is printed every second while the operation runs. Exactly one result
 //! record is printed last; on failure it has `"ok":false` and an `error` text, and the process
 //! exits non-zero. `bytes_processed` counts archive data handled so far, `bytes_reused` the part
-//! of it the server already had, `bytes_uploaded` what was sent. `path` is relative to the
-//! archive root. `skipped_placeholders` lists at most 1000 paths; the count is always complete.
+//! of it the server already had, `bytes_uploaded` the part the server did not have, `bytes_sent` what that
+//! came to on the network after compression and encryption (the number to derive an upload
+//! speed from). `path` is relative to the archive root. `skipped_placeholders` lists at most 1000 paths; the count is always complete.
 //! A restore reports `entries`, `bytes_processed` and `path` only.
 //!
 //! A backup given `--changed-dirs` adds three fields to its result record: `change_list` is
@@ -40,6 +41,7 @@ static ENTRIES: AtomicU64 = AtomicU64::new(0);
 static BYTES_PROCESSED: AtomicU64 = AtomicU64::new(0);
 static BYTES_REUSED: AtomicU64 = AtomicU64::new(0);
 static BYTES_UPLOADED: AtomicU64 = AtomicU64::new(0);
+static BYTES_SENT: AtomicU64 = AtomicU64::new(0);
 static PLACEHOLDERS: AtomicU64 = AtomicU64::new(0);
 static TIME_MACHINE_EXCLUDED: AtomicU64 = AtomicU64::new(0);
 static START: OnceLock<Instant> = OnceLock::new();
@@ -73,6 +75,11 @@ pub fn processed(bytes: usize, reused: bool) {
 
 pub fn uploaded(bytes: usize) {
     BYTES_UPLOADED.fetch_add(bytes as u64, Ordering::Relaxed);
+}
+
+/// The server acknowledged a chunk of this size on the wire (compressed and encrypted).
+pub fn sent(bytes: usize) {
+    BYTES_SENT.fetch_add(bytes as u64, Ordering::Relaxed);
 }
 
 /// A file whose contents are not on disk was left out.
@@ -147,6 +154,7 @@ fn progress_record() -> serde_json::Value {
         "entries": ENTRIES.load(Ordering::Relaxed),
         "bytes_processed": BYTES_PROCESSED.load(Ordering::Relaxed),
         "bytes_uploaded": BYTES_UPLOADED.load(Ordering::Relaxed),
+        "bytes_sent": BYTES_SENT.load(Ordering::Relaxed),
         "path": PATH.lock().unwrap().clone(),
         "elapsed": (elapsed() * 10.0).round() / 10.0,
     })
@@ -192,6 +200,7 @@ pub fn finish(snapshot: Option<(String, String)>, error: Option<String>) {
         "bytes_processed": BYTES_PROCESSED.load(Ordering::Relaxed),
         "bytes_reused": BYTES_REUSED.load(Ordering::Relaxed),
         "bytes_uploaded": BYTES_UPLOADED.load(Ordering::Relaxed),
+        "bytes_sent": BYTES_SENT.load(Ordering::Relaxed),
         "skipped_placeholders": *PLACEHOLDER_PATHS.lock().unwrap(),
         "skipped_placeholder_count": PLACEHOLDERS.load(Ordering::Relaxed),
         "time_machine_excluded": TIME_MACHINE_EXCLUDED.load(Ordering::Relaxed),

@@ -77,6 +77,8 @@ impl IndexType {
 struct ChunkUploadResponse {
     future: h2::client::ResponseFuture,
     size: usize,
+    /// The chunk as it went over the network: compressed and encrypted.
+    encoded_size: usize,
 }
 
 type UploadQueueSender = mpsc::Sender<(MergedChunkInfo, Option<ChunkUploadResponse>)>;
@@ -611,6 +613,7 @@ impl BackupWriter {
                                             // account for uploaded bytes for progress output
                                             uploaded.fetch_add(response.size, Ordering::SeqCst);
                                             crate::report::uploaded(response.size);
+                                            crate::report::sent(response.encoded_size);
                                             future::ok(MergedChunkInfo::Known(list))
                                         }
                                     })
@@ -925,6 +928,7 @@ impl BackupWriter {
                     );
 
                     let chunk_data = chunk_info.chunk.into_inner();
+                    let encoded_size = chunk_data.len();
                     let param = json!({
                         "wid": wid,
                         "digest": digest_str,
@@ -953,6 +957,7 @@ impl BackupWriter {
                                     Some(ChunkUploadResponse {
                                         future: response,
                                         size: chunk_info.chunk_len as usize,
+                                        encoded_size,
                                     }),
                                 ))
                                 .await

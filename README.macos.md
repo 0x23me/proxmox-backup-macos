@@ -104,9 +104,10 @@ Three options of `backup` also exist only here:
   and by applications on caches and build folders), with everything below it.
 - `--progress-json true` (also on `restore`) prints one JSON object per line on standard
   output while the log stays on standard error: a `progress` record every second with
-  `entries`, `bytes_processed`, `bytes_uploaded`, `path` and `elapsed`, and one final `result`
+  `entries`, `bytes_processed`, `bytes_uploaded`, `bytes_sent` (the uploaded data as it went
+  over the network, compressed and encrypted), `path` and `elapsed`, and one final `result`
   record with `ok`, the `snapshot` and `namespace`, `entries`, `bytes_processed`,
-  `bytes_reused`, `bytes_uploaded`, `skipped_placeholders` (at most 1000 paths) with
+  `bytes_reused`, `bytes_uploaded`, `bytes_sent`, `skipped_placeholders` (at most 1000 paths) with
   `skipped_placeholder_count`, `time_machine_excluded`, `warnings` and `duration`. On failure
   the record has `"ok": false` and the exit status is non-zero. The format is described in
   full at the top of `pbs-client/src/report.rs`.
