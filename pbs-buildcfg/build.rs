@@ -3,6 +3,9 @@ use std::env;
 use std::process::Command;
 
 fn main() {
+    // Without this Cargo keeps the commit of the first build: nothing in this package changes
+    // when the repository gets a new commit. scripts/macos/cargo.sh sets REPOID.
+    println!("cargo:rerun-if-env-changed=REPOID");
     let repoid = match env::var("REPOID") {
         Ok(repoid) => repoid,
         Err(_) => match Command::new("git").args(["rev-parse", "HEAD"]).output() {
