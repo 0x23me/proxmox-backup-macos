@@ -1,0 +1,15 @@
+diff --git a/proxmox-async/src/runtime.rs b/proxmox-async/src/runtime.rs
+index caa57fdc..f3d2415c 100644
+--- a/proxmox-async/src/runtime.rs
++++ b/proxmox-async/src/runtime.rs
+@@ -44,7 +44,9 @@ use tokio::runtime::{self, Runtime, RuntimeFlavor};
+ // by dropping the runtime as early as possible
+ static RUNTIME: LazyLock<Mutex<Weak<Runtime>>> = LazyLock::new(|| Mutex::new(Weak::new()));
+ 
+-#[link(name = "crypto")]
++// On macOS the client links OpenSSL statically through openssl-sys, which provides this
++// symbol; naming the library here would load a second, dynamic copy beside it.
++#[cfg_attr(not(target_os = "macos"), link(name = "crypto"))]
+ unsafe extern "C" {
+     fn OPENSSL_thread_stop();
+ }

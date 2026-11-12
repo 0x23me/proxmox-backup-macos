@@ -9,7 +9,8 @@ patches = [
     ("proxmox", "9b5bf494b1759adc0b2db477411a573edf7bce8c", name)
     for name in ("proxmox-time-darwin.patch", "proxmox-sys-darwin-xattrs.patch",
                  "proxmox-sys-darwin-platform.patch", "proxmox-compression-darwin.patch",
-                 "proxmox-uuid-darwin.patch", "proxmox-sys-darwin-directories.patch", "proxmox-sys-mmap-alignment.patch")
+                 "proxmox-uuid-darwin.patch", "proxmox-sys-darwin-directories.patch", "proxmox-sys-mmap-alignment.patch",
+                 "proxmox-async-darwin-openssl.patch")
 ] + [("pathpatterns", "5323cbe49ae5d592eb8a3fa2e215550e83dd7fba", "pathpatterns-darwin.patch")]
 patches += [("pxar", "091a8a382d0d6fc71025351fb35c51b1f3b0074d", "pxar-darwin.patch")]
 patches += [("proxmox-fuse", "ac99ac97f7c2eb7ab9ee6ec3b41034e68b1eca7d", "proxmox-fuse-darwin.patch")]

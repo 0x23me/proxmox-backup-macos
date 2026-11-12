@@ -53,7 +53,10 @@ Intel and older macOS versions have not been verified.
 Build prerequisites are Rust, OpenSSL 3, zstd and pkg-config (Homebrew packages
 `rust`, `openssl@3`, `zstd`, `pkgconf`) and [FUSE-T](https://www.fuse-t.org)
 (`brew install --cask fuse-t`), whose headers and library the build needs; this applies to the
-Homebrew formula too. The built client runs without FUSE-T. Initialize pinned Git submodules and run
+Homebrew formula too. The built client runs without FUSE-T. With `just build` (which runs
+`scripts/macos/cargo.sh`) OpenSSL and zstd are linked into the client, so it needs neither
+on the Mac it runs on; it then needs the macOS version Homebrew built them for, or newer.
+Initialize pinned Git submodules and run
 `python3 scripts/macos/apply-patches.py`. Cargo must run from outside the source
 tree with an explicit manifest to avoid upstream's Debian registry redirect.
 The [Homebrew formula](Formula/proxmox-backup-client.rb) contains the build recipe;

@@ -9,7 +9,9 @@
 #   ("mis-aligned LINKEDIT string pool") and shows up as
 #   "can't find crate for <some procedural macro>";
 # - takes cargo and rustc from PATH, or from nixpkgs when there are none.
-# OpenSSL and zstd come from Homebrew. Output goes to native-target/.
+# OpenSSL and zstd come from Homebrew and are linked into the client, so the built client
+# needs neither at run time (it then runs on the macOS version Homebrew built them for, or
+# newer). Output goes to native-target/.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 if ! command -v cargo >/dev/null || ! command -v rustc >/dev/null; then
@@ -25,6 +27,6 @@ subcommand="$1"; shift
 # What `proxmox-backup-client version` reports as repoid: the commit, marked when files differ from it.
 repoid="$(git -C "$root" rev-parse HEAD)$(git -C "$root" diff --quiet --ignore-submodules HEAD || echo -dirty)"
 env -i HOME="$HOME" REPOID="$repoid" PATH="$tools:/usr/bin:/bin:/usr/sbin:/sbin:$brew/bin" SSL_CERT_FILE=/etc/ssl/cert.pem \
-    OPENSSL_DIR="$brew/opt/openssl@3" ZSTD_SYS_USE_PKG_CONFIG=1 \
+    OPENSSL_DIR="$brew/opt/openssl@3" OPENSSL_STATIC=1 ZSTD_SYS_USE_PKG_CONFIG=1 \
     CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/usr/bin/clang CC=/usr/bin/clang AR=/usr/bin/ar \
     cargo "$subcommand" --locked --manifest-path "$root/Cargo.toml" --target-dir "$root/native-target" "$@"
