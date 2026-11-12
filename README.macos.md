@@ -111,6 +111,10 @@ Three options of `backup` also exist only here:
   the record has `"ok": false` and the exit status is non-zero. The format is described in
   full at the top of `pbs-client/src/report.rs`.
 
+Socket files are left out of a backup: macOS does not open one in any way, so its attributes
+cannot be read, and the program that listens on it makes it again. A file that cannot be
+opened for lack of permission is left out too and named in the result's `warnings`.
+
 ### Reading only what changed
 
 A backup with `--change-detection-mode=metadata` does not read unchanged files, but it still

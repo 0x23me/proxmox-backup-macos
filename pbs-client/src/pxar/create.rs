@@ -890,6 +890,14 @@ impl Archiver {
                 self.path
             );
         }
+        // macOS does not open a socket file in any way ("operation not supported on socket"),
+        // so its attributes cannot be read. Whoever listens on it makes it again; it is left
+        // out without a word, as there are dozens in a home folder.
+        #[cfg(target_os = "macos")]
+        if stat.st_mode & libc::S_IFMT == libc::S_IFSOCK {
+            debug!("skipping socket: {:?}", self.path);
+            return Ok(());
+        }
         let file_mode = stat.st_mode & libc::S_IFMT;
         let open_mode = if file_mode == libc::S_IFREG || file_mode == libc::S_IFDIR {
             OFlag::empty()

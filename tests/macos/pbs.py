@@ -55,6 +55,7 @@ import ctypes.util
 import hashlib
 import json
 import os
+import socket
 import plistlib
 import shutil
 import stat
@@ -813,16 +814,28 @@ def test_unreadable_files(server, work, state):
     write(os.path.join(tree, "open.txt"), b"readable")
     write(os.path.join(tree, "closed.txt"), b"not readable")
     os.chmod(os.path.join(tree, "closed.txt"), 0)
+    # A socket cannot be opened at all on macOS, and a pipe nobody writes to must not make the
+    # backup wait. The socket's path has a short limit, so it is bound from inside the folder.
+    os.mkfifo(os.path.join(tree, "pipe"))
+    listening = socket.socket(socket.AF_UNIX)
+    here = os.getcwd()
+    os.chdir(tree)
+    try:
+        listening.bind("listening")
+    finally:
+        os.chdir(here)
     try:
         snapshot, _ = server.backup("pbs-client-test-unreadable", "tree.pxar", tree, "--progress-json", "true")
     finally:
         os.chmod(os.path.join(tree, "closed.txt"), 0o600)
+        listening.close()
     result = server.records[-1]
     check(result["ok"] is True, "the backup failed because of one unreadable file")
     check(any("closed.txt" in warning for warning in result["warnings"]), f"warnings are {result['warnings']}")
     _, root, _ = server.listing(snapshot, "tree.pxar")
-    check([entry["name"] for entry in root] == ["open.txt"], f"snapshot holds {[entry['name'] for entry in root]}")
-    return "one unreadable file left out and named, the rest backed up"
+    check(sorted(entry["name"] for entry in root) == ["open.txt", "pipe"], f"snapshot holds {[entry['name'] for entry in root]}")
+    check(len(result["warnings"]) == 1, f"warnings are {result['warnings']}")
+    return "one unreadable file left out and named, a socket left out, the rest backed up with a pipe"
 
 
 def test_placeholders(server, work, state):
