@@ -21,6 +21,10 @@ const PREFIX: &str = "user.proxmox.macos.v1";
 const PART: usize = 60 * 1024;
 const MAX_HEADER: usize = 4 * 1024 * 1024;
 const MAX_ATTRIBUTES: usize = 4096;
+/// A value up to this size is kept in memory, not in a spool file: most attributes are a few
+/// dozen bytes, and a file for each costs far more than the value. Up to this much in all.
+const IN_MEMORY: usize = 4096;
+const IN_MEMORY_TOTAL: usize = 256 * 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -57,16 +61,23 @@ struct EncryptedPayload {
     length: u64,
     nonce: [u8; 12],
     tag: [u8; 16],
+    /// An entry of this backup refers to it. Payloads taken in from the previous snapshot are
+    /// only written to the new payload archive when an entry carried over still refers to them.
+    used: bool,
+    /// The value itself when it is small; then there is no spool file, nonce or tag.
+    memory: Option<Vec<u8>>,
 }
 
 /// Local spool is encrypted with an ephemeral process-local key. Its encrypted
 /// bytes, key and nonce are never uploaded. PXAR receives authenticated plaintext
 /// streams, then normal PBS encryption/deduplication applies as selected by CLI.
+/// Small values do not go to the spool; they stay in memory, where they were read to.
 pub struct NativePayloads {
     directory: tempfile::TempDir,
     directory_fd: File,
     key: [u8; 32],
     records: Mutex<BTreeMap<String, EncryptedPayload>>,
+    memory_bytes: std::sync::atomic::AtomicUsize,
 }
 
 impl NativePayloads {
@@ -80,12 +91,63 @@ impl NativePayloads {
             directory_fd,
             key,
             records: Mutex::new(BTreeMap::new()),
+            memory_bytes: Default::default(),
         }))
     }
     pub fn is_empty(&self) -> bool {
-        self.records.lock().unwrap().is_empty()
+        !self
+            .records
+            .lock()
+            .unwrap()
+            .values()
+            .any(|record| record.used)
+    }
+    /// Everything stored so far came from the previous snapshot: nothing refers to it yet.
+    pub fn forget_use(&self) {
+        for record in self.records.lock().unwrap().values_mut() {
+            record.used = false;
+        }
+    }
+    /// Notes that an entry refers to this payload. False when the payload is not stored.
+    fn keep(&self, value: &Payload) -> bool {
+        match self.records.lock().unwrap().get_mut(&value.key) {
+            Some(record) if record.length == value.length => {
+                record.used = true;
+                true
+            }
+            _ => false,
+        }
     }
     fn put(&self, input: &mut dyn Read) -> Result<Payload, Error> {
+        use std::sync::atomic::Ordering;
+        let mut head = Vec::new();
+        input.take(IN_MEMORY as u64 + 1).read_to_end(&mut head)?;
+        if head.len() <= IN_MEMORY
+            && self.memory_bytes.load(Ordering::Relaxed) + head.len() <= IN_MEMORY_TOTAL
+        {
+            let key = hex::encode(sha256(&head));
+            let length = head.len() as u64;
+            let mut records = self.records.lock().unwrap();
+            if let Some(previous) = records.get_mut(&key) {
+                if previous.length != length {
+                    bail!("native payload digest collision");
+                }
+                previous.used = true;
+            } else {
+                self.memory_bytes.fetch_add(head.len(), Ordering::Relaxed);
+                records.insert(
+                    key.clone(),
+                    EncryptedPayload {
+                        length,
+                        nonce: [0; 12],
+                        tag: [0; 16],
+                        used: true,
+                        memory: Some(head),
+                    },
+                );
+            }
+            return Ok(Payload { key, length });
+        }
         let mut nonce = [0; 12];
         openssl::rand::rand_bytes(&mut nonce)?;
         let mut cipher = Crypter::new(
@@ -98,7 +160,10 @@ impl NativePayloads {
         let mut buffer = [0; 65536];
         let mut encrypted = [0; 65552];
         let mut hash = Sha256::new();
-        let mut length = 0u64;
+        hash.update(&head);
+        let mut length = head.len() as u64;
+        let size = cipher.update(&head, &mut encrypted)?;
+        file.write_all(&encrypted[..size])?;
         loop {
             let size = input.read(&mut buffer)?;
             if size == 0 {
@@ -117,22 +182,30 @@ impl NativePayloads {
         cipher.get_tag(&mut tag)?;
         let key = hex::encode(hash.finish());
         let mut records = self.records.lock().unwrap();
-        if let Some(previous) = records.get(&key) {
+        if let Some(previous) = records.get_mut(&key) {
             if previous.length != length {
                 bail!("native payload digest collision");
             }
+            previous.used = true;
         } else {
             file.persist_noclobber(self.directory.path().join(&key))?;
-            records.insert(key.clone(), EncryptedPayload { length, nonce, tag });
+            records.insert(
+                key.clone(),
+                EncryptedPayload {
+                    length,
+                    nonce,
+                    tag,
+                    used: true,
+                    memory: None,
+                },
+            );
         }
         Ok(Payload { key, length })
     }
     pub fn totals(&self) -> (usize, u64) {
         let records = self.records.lock().unwrap();
-        (
-            records.len(),
-            records.values().map(|record| record.length).sum(),
-        )
+        let used = || records.values().filter(|record| record.used);
+        (used().count(), used().map(|record| record.length).sum())
     }
     pub fn write_archive(&self, mut writer: impl Write) -> Result<(), Error> {
         let root = basic_metadata(true);
@@ -142,6 +215,7 @@ impl NativePayloads {
             .lock()
             .unwrap()
             .iter()
+            .filter(|(_, value)| value.used)
             .map(|(key, value)| (key.clone(), value.length))
             .collect();
         for (key, length) in records {
@@ -170,6 +244,11 @@ impl Drop for NativePayloads {
         unsafe {
             OPENSSL_cleanse(self.key.as_mut_ptr().cast(), self.key.len());
         }
+        for record in self.records.lock().unwrap().values_mut() {
+            if let Some(value) = record.memory.as_mut() {
+                unsafe { OPENSSL_cleanse(value.as_mut_ptr().cast(), value.len()) }
+            }
+        }
     }
 }
 
@@ -182,6 +261,19 @@ struct DecryptedPayload {
     hash: Option<Sha256>,
     expected: Payload,
     read: u64,
+}
+/// A stored value, from memory or from the spool.
+enum StoredPayload {
+    Memory(io::Cursor<Vec<u8>>),
+    Spool(Box<DecryptedPayload>),
+}
+impl Read for StoredPayload {
+    fn read(&mut self, target: &mut [u8]) -> io::Result<usize> {
+        match self {
+            StoredPayload::Memory(value) => value.read(target),
+            StoredPayload::Spool(file) => file.read(target),
+        }
+    }
 }
 impl Read for DecryptedPayload {
     fn read(&mut self, target: &mut [u8]) -> io::Result<usize> {
@@ -231,7 +323,7 @@ impl NativePayloads {
             .expect("owned native spool descriptor");
         own.st_dev == stat.st_dev && own.st_ino == stat.st_ino
     }
-    fn reader(&self, value: &Payload) -> Result<DecryptedPayload, Error> {
+    fn reader(&self, value: &Payload) -> Result<StoredPayload, Error> {
         validate_payload(value)?;
         let record = self
             .records
@@ -242,6 +334,10 @@ impl NativePayloads {
             .context("native payload is missing")?;
         if record.length != value.length {
             bail!("native payload length mismatch");
+        }
+        if let Some(memory) = record.memory {
+            // its key is the digest it was stored under
+            return Ok(StoredPayload::Memory(io::Cursor::new(memory)));
         }
         let fd = proxmox_sys::fd::openat(
             &self.directory_fd,
@@ -262,7 +358,7 @@ impl NativePayloads {
             Some(&record.nonce),
         )?;
         cipher.set_tag(&record.tag)?;
-        Ok(DecryptedPayload {
+        Ok(StoredPayload::Spool(Box::new(DecryptedPayload {
             file,
             cipher,
             pending: Vec::new(),
@@ -271,7 +367,7 @@ impl NativePayloads {
             hash: Some(Sha256::new()),
             expected: value.clone(),
             read: 0,
-        })
+        })))
     }
 }
 
@@ -434,6 +530,19 @@ pub fn decode(metadata: &pxar::Metadata) -> Result<Option<NativeMetadata>, Error
     Ok(Some(native))
 }
 
+/// For an entry carried over from the previous snapshot: notes that its attribute values are
+/// still referred to. False when one of them is not in `store`; the entry then has to be read
+/// from disk, or the new snapshot could not restore it.
+pub fn keep_payloads(metadata: &pxar::Metadata, store: &NativePayloads) -> Result<bool, Error> {
+    let Some(native) = decode(metadata)? else {
+        return Ok(true);
+    };
+    Ok(native
+        .attributes
+        .iter()
+        .all(|attribute| store.keep(&attribute.payload)))
+}
+
 fn validate_payload(value: &Payload) -> Result<(), Error> {
     if value.key.len() != 64
         || !value
@@ -467,7 +576,7 @@ pub(crate) fn restoring_native_metadata() -> bool {
     RESTORE.with(|slot| slot.borrow().is_some())
 }
 
-fn payload_file(value: &Payload) -> Result<DecryptedPayload, Error> {
+fn payload_file(value: &Payload) -> Result<StoredPayload, Error> {
     let root = RESTORE
         .with(|slot| slot.borrow().clone())
         .context("native payload archive was not loaded")?;

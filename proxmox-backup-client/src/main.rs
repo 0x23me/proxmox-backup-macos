@@ -809,6 +809,16 @@ fn spawn_catalog_upload(
                 optional: true,
                 default: false,
             },
+            "changed-dirs": {
+                type: String,
+                description: "File naming the directories that changed since the snapshot given with --changed-dirs-base: records ended by a NUL byte, each 'd' (entries directly in it changed) or 'r' (everything below changed) and an absolute path. With change detection mode 'metadata', only these are read from disk; every other directory is taken over from that snapshot.",
+                optional: true,
+            },
+            "changed-dirs-base": {
+                type: String,
+                description: "Backup time (RFC 3339, as in the snapshot name) of the snapshot the list of changed directories is relative to. The list is ignored when that is not the snapshot this backup builds on.",
+                optional: true,
+            },
             "no-cache": {
                 type: Boolean,
                 description: "Bypass local datastore cache for network storages.",
@@ -858,6 +868,23 @@ async fn create_backup(
     let backup_ns = optional_ns_param(&param)?;
 
     let backup_type: BackupType = param["backup-type"].as_str().unwrap_or("host").parse()?;
+
+    // The list of changed directories and the backup time it is relative to.
+    let mut change_list = match (
+        param["changed-dirs"].as_str(),
+        param["changed-dirs-base"].as_str(),
+    ) {
+        (Some(file), Some(base)) => {
+            let data = std::fs::read(file)
+                .map_err(|err| format_err!("unable to read the change list {file:?} - {err}"))?;
+            pbs_client::pxar::changed_dirs::ChangedDirs::check(&data)?;
+            let base = proxmox_time::parse_rfc3339(base)
+                .map_err(|err| format_err!("--changed-dirs-base: {err}"))?;
+            Some((data, base))
+        }
+        (None, None) => None,
+        _ => bail!("--changed-dirs and --changed-dirs-base are only used together"),
+    };
 
     let include_dev = param["include-dev"].as_array();
 
@@ -1125,6 +1152,34 @@ async fn create_backup(
         None
     };
 
+    // The change list only tells what changed since one snapshot: without exactly that one to
+    // build on, everything is read.
+    if let Some((_, base)) = change_list {
+        pbs_client::report::change_list_given();
+        let reason = if !detection_mode.is_metadata() {
+            Some("change detection mode is not 'metadata'".to_string())
+        } else if dry_run {
+            Some("dry run".to_string())
+        } else if previous_manifest.is_none() {
+            Some("no previous backup to build on".to_string())
+        } else {
+            match client.previous_backup_time().await {
+                Ok(Some(previous)) if previous == base => None,
+                Ok(Some(previous)) => Some(format!(
+                    "this backup builds on {}, the list is relative to {}",
+                    proxmox_time::epoch_to_rfc3339_utc(previous)?,
+                    proxmox_time::epoch_to_rfc3339_utc(base)?,
+                )),
+                _ => Some("no previous backup to build on".to_string()),
+            }
+        };
+        if let Some(reason) = reason {
+            log::info!("Not using the list of changed directories: {reason}");
+            pbs_client::report::change_list_ignored(reason);
+            change_list = None;
+        }
+    }
+
     let mut manifest = BackupManifest::new(snapshot.clone());
 
     let mut catalog = None;
@@ -1150,6 +1205,59 @@ async fn create_backup(
         .try_into()?;
     #[cfg(target_os = "macos")]
     let mut native_primary_archives = Vec::new();
+
+    // Entries carried over refer to attribute values in the previous snapshot's payload
+    // archive, and the new snapshot needs those in its own. Take them in; what no entry
+    // refers to any more is not written again.
+    #[cfg(target_os = "macos")]
+    if let (Some((_, base)), Some(previous_manifest)) = (&change_list, &previous_manifest) {
+        let backup_dir: BackupDir = (snapshot.group.clone(), *base).into();
+        let result = async {
+            let reader = BackupReader::start(
+                &http_client,
+                crypt_config.clone(),
+                repo.store(),
+                &backup_ns,
+                &backup_dir,
+                true,
+            )
+            .await?;
+            if let Some(map) = native_backup_map(&reader, previous_manifest).await? {
+                if let Some(payload_archive) = map.payload_archive {
+                    let reader = get_buffered_pxar_reader(
+                        &payload_archive,
+                        reader,
+                        previous_manifest,
+                        crypt_config.clone(),
+                    )
+                    .await?;
+                    let decoder =
+                        pxar::decoder::Decoder::from_std(pxar::PxarVariant::Unified(reader))?;
+                    pbs_client::pxar::darwin_archive::unpack_payloads(
+                        decoder,
+                        &native_payloads,
+                        map.payload_count,
+                        map.payload_bytes,
+                    )?;
+                    native_payloads.forget_use();
+                    log::info!(
+                        "Took in {} attribute values ({}) of the previous backup",
+                        map.payload_count,
+                        HumanByte::from(map.payload_bytes),
+                    );
+                }
+            }
+            Ok::<_, Error>(())
+        }
+        .await;
+        if let Err(err) = result {
+            let reason = format!("the previous backup's Mac attributes cannot be read: {err:#}");
+            log::info!("Not using the list of changed directories: {reason}");
+            pbs_client::report::change_list_ignored(reason);
+            native_payloads.forget_use();
+            change_list = None;
+        }
+    }
 
     for (backup_type, filename, target_base, extension, size) in upload_list {
         let target: BackupArchiveName = format!("{target_base}.{extension}").as_str().try_into()?;
@@ -1275,6 +1383,23 @@ async fn create_backup(
                     None
                 };
 
+                let changed_dirs = match &change_list {
+                    Some((data, _)) if previous_ref.is_some() => {
+                        Some(pbs_client::pxar::changed_dirs::ChangedDirs::parse(
+                            data,
+                            Path::new(&filename),
+                        )?)
+                    }
+                    Some(_) => {
+                        let reason =
+                            format!("'{target}' has no previous split archive to build on");
+                        log::info!("Not using the list of changed directories: {reason}");
+                        pbs_client::report::change_list_ignored(reason);
+                        None
+                    }
+                    None => None,
+                };
+
                 let pxar_options = pbs_client::pxar::PxarCreateOptions {
                     device_set: devices.clone(),
                     patterns: pattern_list.clone(),
@@ -1285,6 +1410,7 @@ async fn create_backup(
                     skip_tm_excluded,
                     previous_ref,
                     max_cache_size,
+                    changed_dirs,
                     #[cfg(target_os = "macos")]
                     native_payloads: Some(native_payloads.clone()),
                 };
@@ -1463,6 +1589,11 @@ async fn create_backup(
 
     let end_time = std::time::Instant::now();
     let elapsed = end_time.duration_since(start_time);
+    if let Some((state, carried, walked)) = pbs_client::report::change_list() {
+        log::info!(
+            "List of changed directories {state}: {carried} directories carried over, {walked} read from disk"
+        );
+    }
     log::info!("Duration: {:.2}s", elapsed.as_secs_f64());
     log::info!("End Time: {}", strftime_local("%c", epoch_i64())?);
     pbs_client::report::finish(Some((snapshot.to_string(), backup_ns.to_string())), None);
@@ -2457,14 +2588,13 @@ fn main() {
     );
 }
 
+/// Which archives of a snapshot carry Mac metadata and where the attribute values are. None
+/// for a snapshot without Mac metadata.
 #[cfg(target_os = "macos")]
-async fn restore_native_payloads(
-    client: Arc<BackupReader>,
+async fn native_backup_map(
+    client: &BackupReader,
     manifest: &BackupManifest,
-    crypt: Option<Arc<CryptConfig>>,
-    primary: &BackupArchiveName,
-    ignore_xattrs: bool,
-) -> Result<Option<Arc<pbs_client::pxar::darwin_archive::NativePayloads>>, Error> {
+) -> Result<Option<pbs_client::pxar::darwin_archive::NativeBackupMap>, Error> {
     let name: BackupArchiveName = "macos-metadata.json.blob".try_into()?;
     if manifest.lookup_file_info(&name).is_err() {
         return Ok(None);
@@ -2479,6 +2609,20 @@ async fn restore_native_payloads(
     if map.version != 1 || map.primary_archives.len() > 4096 {
         bail!("invalid native metadata map");
     }
+    Ok(Some(map))
+}
+
+#[cfg(target_os = "macos")]
+async fn restore_native_payloads(
+    client: Arc<BackupReader>,
+    manifest: &BackupManifest,
+    crypt: Option<Arc<CryptConfig>>,
+    primary: &BackupArchiveName,
+    ignore_xattrs: bool,
+) -> Result<Option<Arc<pbs_client::pxar::darwin_archive::NativePayloads>>, Error> {
+    let Some(map) = native_backup_map(&client, manifest).await? else {
+        return Ok(None);
+    };
     if !map.primary_archives.contains(primary) {
         return Ok(None);
     }

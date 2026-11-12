@@ -111,6 +111,69 @@ Three options of `backup` also exist only here:
   the record has `"ok": false` and the exit status is non-zero. The format is described in
   full at the top of `pbs-client/src/report.rs`.
 
+### Reading only what changed
+
+A backup with `--change-detection-mode=metadata` does not read unchanged files, but it still
+looks at every file and folder to see that they are unchanged. Told which folders changed, it
+skips that as well:
+
+```sh
+proxmox-backup-client backup home.pxar:/Users/me --change-detection-mode=metadata \
+    --changed-dirs /path/to/list --changed-dirs-base 2026-11-12T08:00:00Z
+```
+
+`--changed-dirs` names a file of records, each ended by a NUL byte: one byte for the kind and
+an absolute path, as the client sees the folder being backed up (as given, or with symbolic
+links resolved).
+
+- `d<path>`: entries directly in this folder changed. It is read from disk. A folder in it
+  is carried over unless it is named itself, has a named folder below it, or its own
+  metadata differs from the previous snapshot.
+- `r<path>`: everything at and below this path is read from disk. For a folder that was
+  renamed or moved, or when the source of the list lost track of what happened below.
+
+`--changed-dirs-base` is the time, as in its name, of the snapshot the list is relative to.
+The top folder is always read. Paths outside the folder being backed up are ignored, so one
+list serves a backup of several folders; a path that does not exist is ignored too.
+
+A folder that is not read is carried over: its entries, their metadata and Mac attributes,
+and for files the place of their contents, are taken from the previous snapshot's metadata
+archive. Nothing below it is opened or even listed. The result with `--progress-json` gains
+`change_list` (`"used"` or `"ignored: <reason>"`), `carried_dirs` and `walked_dirs`.
+
+The list is ignored, and everything is read as without it, when the backup does not build on
+exactly the snapshot named (another backup ran in between, the previous one is gone or was
+made with another key), when an archive has no previous split archive, or when the previous
+snapshot's Mac attribute archive cannot be read.
+
+What this means:
+
+- The backup is as complete as the list. A change in a folder the list does not name is not
+  in the snapshot, and not in later ones either until that folder is named or everything is
+  read again. Whoever writes the list has to name too much rather than too little, and
+  leave the list out whenever it may have a gap.
+- A folder moved or renamed with everything in it needs an `r` record at its new place.
+  Without one it is still read when it looks different from what the previous snapshot has
+  under that name (dates, mode, attributes); a folder that looks the same is taken for the
+  same.
+- Exclusions (`--exclude`, `.pxarexclude`, `--skip-tm-excluded`, `--skip-placeholders`) are
+  not applied again to what is carried over: it stays as the previous run decided. Change
+  the exclusions without the list. The counts of skipped entries cover the folders read.
+- A folder with a `.pxarexclude` file is always read, so that its patterns hold below it;
+  so is a folder in which the list names a folder that the previous snapshot does not have.
+- Hard links stay hard links, whether link and target are carried over or read. A link whose
+  target was read is read too.
+- Files carried over are never encoded again, so the rule that re-encodes files when reusing
+  their chunks would drag along more than 10 % of other data does not apply to them. The
+  payload archive can refer to somewhat more data than it needs after many runs; a run
+  without the list tidies that up.
+- The previous snapshot's Mac attribute archive (`native-macos-payloads-N.pxar`) is
+  downloaded at the start of the run, because the new snapshot needs the attribute values of
+  what it carries over in its own. Values nothing refers to any more are dropped.
+
+On a tree of 60,000 small files, half of them with an attribute, a run over the unchanged
+tree took 2.5 s without the list and 0.5 s with it, against a server on the local network.
+
 ### Mounting an archive
 
 ```sh

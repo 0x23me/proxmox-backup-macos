@@ -47,6 +47,7 @@
 //! (user, group, acl, ...) because this is already defined by the
 //! linked `ENTRY`.
 
+pub mod changed_dirs;
 pub(crate) mod create;
 #[cfg(target_os = "macos")]
 mod darwin;

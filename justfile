@@ -16,6 +16,7 @@ build:
 # The tests that need no server: archive and restore on the local filesystem, formats, keys
 test:
     {{cargo}} test --package pbs-client --test macos_filesystem
+    {{cargo}} test --package pbs-client --test changed_dirs
     # Two test sets of the base port only build on Linux and are left out here:
     # `--package pbs-client --lib` (create.rs tests build an Archiver without the macOS fields)
     # and `--package proxmox-sys` (links libcrypt and libacl).

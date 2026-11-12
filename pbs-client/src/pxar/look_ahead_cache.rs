@@ -25,7 +25,40 @@ pub(crate) enum CacheEntry {
     RegEntry(CacheEntryData),
     DirEntry(CacheEntryData),
     DirEnd,
+    Carried(CarriedEntry),
 }
+
+/// An entry taken over from the previous archive as it is there, without a look at the disk.
+/// A directory is closed by a `DirEnd`, like one read from disk.
+pub(crate) struct CarriedEntry {
+    pub(crate) c_file_name: CString,
+    pub(crate) metadata: Metadata,
+    pub(crate) kind: CarriedKind,
+}
+
+pub(crate) enum CarriedKind {
+    Directory,
+    /// `payload_offset` is relative to the start of the cached range, as for a `RegEntry`.
+    /// `link_target` is where to note the file's place in the new archive, for a hard link
+    /// to it that is carried over later.
+    File {
+        size: u64,
+        payload_offset: PayloadOffset,
+        link_target: Option<usize>,
+    },
+    /// A hard link to a file carried over before it; `path` is that file's.
+    Hardlink {
+        link_target: usize,
+        path: std::ffi::OsString,
+    },
+    Symlink(std::ffi::OsString),
+    Device(pxar::format::Device),
+    Fifo,
+    Socket,
+}
+
+/// A carried entry holds no file descriptor, but its metadata: this many are kept at most.
+const CARRIED_ENTRIES_MAX: usize = 8192;
 
 pub(crate) struct PxarLookaheadCache {
     // Current state of the cache
@@ -44,6 +77,9 @@ pub(crate) struct PxarLookaheadCache {
     fd_entries: usize,
     // Max number of entries with file descriptors
     cache_size: usize,
+    // Number of entries carried over from the previous archive, and how many of them are files
+    carried_entries: usize,
+    carried_files: usize,
 }
 
 impl PxarLookaheadCache {
@@ -57,11 +93,31 @@ impl PxarLookaheadCache {
             start_path: PathBuf::new(),
             fd_entries: 0,
             cache_size: size.unwrap_or(DEFAULT_CACHE_SIZE),
+            carried_entries: 0,
+            carried_files: 0,
         }
     }
 
     pub(crate) fn is_full(&self) -> bool {
-        self.fd_entries >= self.cache_size
+        self.fd_entries >= self.cache_size || self.carried_entries >= CARRIED_ENTRIES_MAX
+    }
+
+    /// Carried files cannot be encoded again from disk: a range with one in it is reused.
+    pub(crate) fn has_carried_files(&self) -> bool {
+        self.carried_files > 0
+    }
+
+    /// `parent` is the path of the directory the entry is in.
+    pub(crate) fn insert_carried(&mut self, entry: CarriedEntry, parent: &std::path::Path) {
+        if !self.enabled {
+            self.start_path = parent.to_path_buf();
+        }
+        self.enabled = true;
+        self.carried_entries += 1;
+        if let CarriedKind::File { .. } = entry.kind {
+            self.carried_files += 1;
+        }
+        self.entries.push(CacheEntry::Carried(entry));
     }
 
     pub(crate) fn caching_enabled(&self) -> bool {
@@ -110,6 +166,8 @@ impl PxarLookaheadCache {
 
     pub(crate) fn take_and_reset(&mut self) -> (Vec<CacheEntry>, PathBuf) {
         self.fd_entries = 0;
+        self.carried_entries = 0;
+        self.carried_files = 0;
         self.enabled = false;
         // keep end for possible continuation if cache has been cleared because
         // it was full, but further caching would be fine

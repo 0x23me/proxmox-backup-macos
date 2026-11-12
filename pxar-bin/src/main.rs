@@ -385,6 +385,7 @@ async fn create_archive(
         skip_tm_excluded: false,
         previous_ref: None,
         max_cache_size: None,
+        changed_dirs: None,
     };
 
     let source = PathBuf::from(source);

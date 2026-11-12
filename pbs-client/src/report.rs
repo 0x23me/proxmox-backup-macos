@@ -19,6 +19,10 @@
 //! archive root. `skipped_placeholders` lists at most 1000 paths; the count is always complete.
 //! A restore reports `entries`, `bytes_processed` and `path` only.
 //!
+//! A backup given `--changed-dirs` adds three fields to its result record: `change_list` is
+//! `"used"` or `"ignored: <reason>"`, `carried_dirs` counts the directories taken over from
+//! the previous snapshot without reading them, `walked_dirs` those read from disk.
+//!
 //! The counters are kept whether or not records are requested, so the hooks cost a few atomic
 //! additions; the current path is only stored while records are on.
 
@@ -42,6 +46,10 @@ static START: OnceLock<Instant> = OnceLock::new();
 static PATH: Mutex<String> = Mutex::new(String::new());
 static PLACEHOLDER_PATHS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static WARNINGS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+static CARRIED_DIRS: AtomicU64 = AtomicU64::new(0);
+static WALKED_DIRS: AtomicU64 = AtomicU64::new(0);
+/// None without a change list; else why it was not used, per archive, empty when it was.
+static CHANGE_LIST: Mutex<Option<Vec<String>>> = Mutex::new(None);
 
 const LISTED: usize = 1000;
 
@@ -86,6 +94,47 @@ pub fn warning(text: String) {
     if warnings.len() < LISTED {
         warnings.push(text);
     }
+}
+
+/// A directory was taken over from the previous snapshot without reading it from disk.
+pub fn carried_dir() {
+    CARRIED_DIRS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A directory was read from disk.
+pub fn walked_dir() {
+    WALKED_DIRS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The backup was given a list of changed directories.
+pub fn change_list_given() {
+    CHANGE_LIST.lock().unwrap().get_or_insert_with(Vec::new);
+}
+
+/// The list of changed directories is not used, for everything or for one archive.
+pub fn change_list_ignored(reason: String) {
+    CHANGE_LIST
+        .lock()
+        .unwrap()
+        .get_or_insert_with(Vec::new)
+        .push(reason);
+}
+
+/// `(what became of the change list, directories carried over, directories read)`, when the
+/// backup was given a change list.
+pub fn change_list() -> Option<(String, u64, u64)> {
+    let reasons = CHANGE_LIST.lock().unwrap();
+    let reasons = reasons.as_ref()?;
+    let state = if reasons.is_empty() {
+        "used".to_string()
+    } else {
+        format!("ignored: {}", reasons.join("; "))
+    };
+    Some((
+        state,
+        CARRIED_DIRS.load(Ordering::Relaxed),
+        WALKED_DIRS.load(Ordering::Relaxed),
+    ))
 }
 
 fn elapsed() -> f64 {
@@ -149,6 +198,11 @@ pub fn finish(snapshot: Option<(String, String)>, error: Option<String>) {
         "warnings": *WARNINGS.lock().unwrap(),
         "duration": (elapsed() * 100.0).round() / 100.0,
     });
+    if let Some((state, carried, walked)) = change_list() {
+        record["change_list"] = state.into();
+        record["carried_dirs"] = carried.into();
+        record["walked_dirs"] = walked.into();
+    }
     if let Some((name, namespace)) = snapshot {
         record["snapshot"] = name.into();
         record["namespace"] = namespace.into();

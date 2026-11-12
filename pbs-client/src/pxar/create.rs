@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use pathpatterns::{MatchEntry, MatchFlag, MatchList, MatchType, PatternFlag};
 use proxmox_sys::error::SysError;
 use pxar::accessor::ReadAt;
-use pxar::accessor::aio::{Accessor, Directory};
+use pxar::accessor::aio::{Accessor, Directory, FileEntry};
 use pxar::encoder::{LinkOffset, PayloadOffset, SeqWrite};
 use pxar::{EntryKind, Metadata, PxarVariant};
 
@@ -38,7 +38,10 @@ use pbs_datastore::index::IndexFile;
 
 use crate::inject_reused_chunks::InjectChunks;
 use crate::pxar::Flags;
-use crate::pxar::look_ahead_cache::{CacheEntry, CacheEntryData, PxarLookaheadCache};
+use crate::pxar::changed_dirs::{Change, ChangedDirs};
+use crate::pxar::look_ahead_cache::{
+    CacheEntry, CacheEntryData, CarriedEntry, CarriedKind, PxarLookaheadCache,
+};
 use crate::pxar::metadata::errno_is_unsupported;
 use crate::pxar::tools::assert_single_path_component;
 
@@ -71,6 +74,9 @@ pub struct PxarCreateOptions {
     pub previous_ref: Option<PxarPrevRef>,
     /// Maximum number of lookahead cache entries
     pub max_cache_size: Option<usize>,
+    /// The directories that changed since the snapshot of `previous_ref`. With it, only those
+    /// are read from disk; the others are carried over from the previous metadata archive.
+    pub changed_dirs: Option<ChangedDirs>,
     #[cfg(target_os = "macos")]
     pub native_payloads: Option<Arc<super::darwin_archive::NativePayloads>>,
 }
@@ -226,6 +232,14 @@ struct Archiver {
     last_reusable_offset: Option<u64>,
     reuse_stats: ReuseStats,
     split_archive: bool,
+    /// The directories that changed since the previous snapshot, when the caller knows them.
+    changed_dirs: Option<ChangedDirs>,
+    /// The archived directory, to open a directory below it that the walk did not come through.
+    root: Option<OwnedFd>,
+    /// The files carried over, in archive order: where each was in the previous metadata
+    /// archive and, once written, where it is in the new one. A hard link refers to its
+    /// target by position, so carrying a link over needs the new position of its target.
+    carried_files: Vec<(u64, Option<LinkOffset>)>,
     #[cfg(target_os = "macos")]
     native_payloads: Option<Arc<super::darwin_archive::NativePayloads>>,
     #[cfg(target_os = "macos")]
@@ -318,6 +332,18 @@ where
             (None, None)
         };
 
+    // Carrying directories over needs the previous archive to take them from.
+    let changed_dirs = options
+        .changed_dirs
+        .filter(|_| metadata_mode && previous_metadata_accessor.is_some());
+    let root = match changed_dirs {
+        Some(_) => Some(
+            unsafe { std::os::fd::BorrowedFd::borrow_raw(source_dir.as_raw_fd()) }
+                .try_clone_to_owned()?,
+        ),
+        None => None,
+    };
+
     let mut encoder = Encoder::new(writers.archive, &metadata, prelude.as_deref()).await?;
 
     let mut archiver = Archiver {
@@ -344,6 +370,9 @@ where
         last_reusable_offset: None,
         reuse_stats: ReuseStats::default(),
         split_archive,
+        changed_dirs,
+        root,
+        carried_files: Vec::new(),
         #[cfg(target_os = "macos")]
         native_payloads: options.native_payloads,
         #[cfg(target_os = "macos")]
@@ -416,6 +445,7 @@ impl Archiver {
     ) -> BoxFuture<'a, Result<(), Error>> {
         async move {
             let entry_counter = self.entry_counter;
+            crate::report::walked_dir();
 
             let old_patterns_count = self.patterns.len();
             self.read_pxar_excludes(dir.as_raw_fd())?;
@@ -971,6 +1001,14 @@ impl Archiver {
                     st_dev: stat.st_dev as u64,
                     st_ino: stat.st_ino,
                 };
+                if !self.carried_files.is_empty()
+                    && !self.cache.contains_hardlink(&link_info)
+                    && !self.hardlinks.contains_key(&link_info)
+                {
+                    let file_name: &Path = OsStr::from_bytes(c_file_name.to_bytes()).as_ref();
+                    self.note_carried_link_target(encoder, previous_metadata, file_name, stat)
+                        .await?;
+                }
                 if self.cache.contains_hardlink(&link_info) {
                     // This hardlink has been seen by the lookahead cache already, put it on the cache
                     // with a dummy offset and continue without lookup and chunk injection.
@@ -1213,8 +1251,10 @@ impl Archiver {
             let ratio = padding as f64 / total_size as f64;
 
             // do not reuse chunks if introduced padding higher than threshold
-            // opt for re-encoding in that case
-            if ratio > CHUNK_PADDING_THRESHOLD {
+            // opt for re-encoding in that case, unless there are files among the cached
+            // entries that were carried over from the previous archive: those were not
+            // opened, and reading them is what carrying them over is there to avoid
+            if ratio > CHUNK_PADDING_THRESHOLD && !self.cache.has_carried_files() {
                 debug!(
                     "Padding ratio: {ratio} > {CHUNK_PADDING_THRESHOLD}, padding: {}, total {}, chunks: {}",
                     HumanByte::from(padding),
@@ -1327,6 +1367,10 @@ impl Archiver {
                     }
                     self.path.pop();
                 }
+                CacheEntry::Carried(entry) => {
+                    self.encode_carried_entry(encoder, entry, base_offset)
+                        .await?
+                }
             }
         }
 
@@ -1429,16 +1473,32 @@ impl Archiver {
             Ok(())
         } else {
             let mut dir_accessor = None;
+            let mut unchanged = false;
             if let Some(accessor) = previous_metadata_accessor.as_mut() {
                 if let Some(file_entry) = accessor.lookup(dir_name).await? {
                     if file_entry.entry().is_dir() {
+                        unchanged = file_entry.metadata() == metadata;
                         let dir = file_entry.enter_directory().await?;
                         dir_accessor = Some(dir);
                     }
                 }
             }
-            self.archive_dir_contents(encoder, dir_accessor, dir, false)
-                .await
+            // A directory that is not named in the list of changed directories, and looks
+            // itself as it did in the previous snapshot, is not read: its entries are taken
+            // from there. One that looks different may be another directory under this name.
+            let carry = unchanged
+                && old_st_dev == stat.st_dev
+                && dir_accessor.is_some()
+                && self
+                    .changed_dirs
+                    .as_ref()
+                    .is_some_and(|list| list.state(&self.path) != Change::Read);
+            if carry && self.carry_dir_contents(encoder, &mut dir_accessor).await? {
+                Ok(())
+            } else {
+                self.archive_dir_contents(encoder, dir_accessor, dir, false)
+                    .await
+            }
         };
 
         self.fs_magic = old_fs_magic;
@@ -1455,6 +1515,443 @@ impl Archiver {
         }
 
         result
+    }
+
+    /// The entries directly in the directory `previous`, in the order they have in the
+    /// archive, when all of them can be taken over as they are. None when the directory has
+    /// to be read from disk instead:
+    ///
+    /// * the list of changed directories names a directory in it that is not among them;
+    /// * it has a `.pxarexclude` file, whose patterns are needed for what is read below it;
+    /// * an entry refers to attribute data that was not taken in from the previous snapshot;
+    /// * its files are not in the order of their contents in the previous payload archive.
+    async fn carriable_entries(
+        &mut self,
+        previous: &Directory<MetadataArchiveReader>,
+    ) -> Result<Option<Vec<FileEntry<MetadataArchiveReader>>>, Error> {
+        let mut entries = Vec::with_capacity(previous.entry_count());
+        let mut listing = previous.read_dir();
+        while let Some(entry) = listing.next().await {
+            entries.push(entry?.decode_entry().await?);
+        }
+        // the listing follows the lookup table; contents have to be referred to in archive order
+        entries.sort_unstable_by_key(|entry| entry.entry_range_info().entry_range.start);
+
+        if let Some(list) = self.changed_dirs.as_ref() {
+            // the list names a directory in here that the previous snapshot does not have:
+            // it was made since, so entries of this directory changed, whatever the list says
+            let unknown = list.named_in(&self.path).into_iter().any(|name| {
+                !entries
+                    .iter()
+                    .any(|entry| entry.file_name() == name && entry.is_dir())
+            });
+            if unknown {
+                return Ok(None);
+            }
+        }
+
+        let mut last_offset = self.last_reusable_offset;
+        for entry in &entries {
+            match entry.kind() {
+                EntryKind::File {
+                    payload_offset: Some(offset),
+                    ..
+                } => {
+                    if !try_record_strictly_greater(&mut last_offset, *offset) {
+                        return Ok(None);
+                    }
+                }
+                EntryKind::Directory
+                | EntryKind::Symlink(_)
+                | EntryKind::Hardlink(_)
+                | EntryKind::Device(_)
+                | EntryKind::Fifo
+                | EntryKind::Socket => (),
+                _ => return Ok(None),
+            }
+            if entry.file_name().as_bytes() == b".pxarexclude" {
+                return Ok(None);
+            }
+            #[cfg(target_os = "macos")]
+            if let Some(store) = self.native_payloads.as_ref() {
+                if !super::darwin_archive::keep_payloads(entry.metadata(), store)? {
+                    return Ok(None);
+                }
+            }
+        }
+        Ok(Some(entries))
+    }
+
+    /// Takes the contents of the directory at `self.path` over from the previous archive
+    /// without reading the directory from disk: entries, metadata, and for a file the place
+    /// of its contents in the previous payload archive. Directories below it are taken over
+    /// the same way, except those the list of changed directories names, which are read.
+    ///
+    /// Returns false, with nothing written, when the directory has to be read from disk.
+    fn carry_dir_contents<'a, T: SeqWrite + Send>(
+        &'a mut self,
+        encoder: &'a mut Encoder<'_, T>,
+        previous: &'a mut Option<Directory<MetadataArchiveReader>>,
+    ) -> BoxFuture<'a, Result<bool, Error>> {
+        async move {
+            let Some(directory) = previous.as_ref() else {
+                return Ok(false);
+            };
+            let Some(entries) = self.carriable_entries(directory).await? else {
+                debug!("not carried over, read from disk: {:?}", self.path);
+                return Ok(false);
+            };
+            self.carry_entries(encoder, previous, entries).await?;
+            Ok(true)
+        }
+        .boxed()
+    }
+
+    /// Writes the entries of the directory at `self.path` as [`Self::carriable_entries`]
+    /// found them in `previous`, that directory in the previous archive.
+    fn carry_entries<'a, T: SeqWrite + Send>(
+        &'a mut self,
+        encoder: &'a mut Encoder<'_, T>,
+        previous: &'a mut Option<Directory<MetadataArchiveReader>>,
+        entries: Vec<FileEntry<MetadataArchiveReader>>,
+    ) -> BoxFuture<'a, Result<(), Error>> {
+        async move {
+            crate::report::carried_dir();
+
+            for entry in entries {
+                let c_file_name = CString::new(entry.file_name().as_bytes())?;
+                self.path.push(entry.file_name());
+                let result = self
+                    .carry_entry(encoder, previous, &entry, c_file_name)
+                    .await
+                    .unique_context(format!("error at {:?}", self.path));
+                self.path.pop();
+                result?;
+            }
+            Ok(())
+        }
+        .boxed()
+    }
+
+    /// One entry of a directory that is carried over; `self.path` is the entry's.
+    async fn carry_entry<T: SeqWrite + Send>(
+        &mut self,
+        encoder: &mut Encoder<'_, T>,
+        parent: &mut Option<Directory<MetadataArchiveReader>>,
+        entry: &FileEntry<MetadataArchiveReader>,
+        c_file_name: CString,
+    ) -> Result<(), Error> {
+        (self.callback)(&self.path)?;
+
+        // carried entries hold no file descriptor, but their metadata: write them out in time
+        if self.cache.is_full() {
+            self.flush_cached_reusing_if_below_threshold(encoder, true)
+                .await?;
+        }
+
+        let mut directory = None;
+        let kind = match entry.kind() {
+            EntryKind::Directory => {
+                let named = self
+                    .changed_dirs
+                    .as_ref()
+                    .is_some_and(|list| list.state(&self.path) == Change::Read);
+                let previous = entry.enter_directory().await?;
+                let entries = match named {
+                    true => None,
+                    false => self.carriable_entries(&previous).await?,
+                };
+                let Some(entries) = entries else {
+                    // read with its own metadata as well: it may be why it has to be read
+                    return self
+                        .add_entry_from_disk(encoder, parent, &c_file_name)
+                        .await;
+                };
+                directory = Some((previous, entries));
+                CarriedKind::Directory
+            }
+            EntryKind::File {
+                size,
+                payload_offset: Some(offset),
+                ..
+            } => {
+                if !self.try_record_reusable_offset(*offset) {
+                    // only with a previous archive whose contents are out of order
+                    return self
+                        .add_entry_from_disk(encoder, parent, &c_file_name)
+                        .await;
+                }
+                let range = *offset..*offset + size + size_of::<pxar::format::Header>() as u64;
+                if !self.cache.try_extend_range(range.clone()) {
+                    self.flush_cached_reusing_if_below_threshold(encoder, true)
+                        .await?;
+                    self.cache.update_range(range.clone());
+                }
+                // in archive order these positions only grow, so that a link finds its target
+                let link_target = entry
+                    .entry_range_info()
+                    .filename_header_offset
+                    .filter(|position| {
+                        self.carried_files
+                            .last()
+                            .is_none_or(|(last, _)| last < position)
+                    })
+                    .map(|position| {
+                        self.carried_files.push((position, None));
+                        self.carried_files.len() - 1
+                    });
+                CarriedKind::File {
+                    size: *size,
+                    payload_offset: PayloadOffset::default()
+                        .add(range.start - self.cache.range().start),
+                    link_target,
+                }
+            }
+            EntryKind::Hardlink(link) => match self.carried_link_target(entry) {
+                Some(link_target) => CarriedKind::Hardlink {
+                    link_target,
+                    path: link.as_os_str().to_owned(),
+                },
+                // its target was read from disk, where this link is found to be one too
+                None => {
+                    return self
+                        .add_entry_from_disk(encoder, parent, &c_file_name)
+                        .await;
+                }
+            },
+            EntryKind::Symlink(link) => CarriedKind::Symlink(link.as_os_str().to_owned()),
+            EntryKind::Device(device) => CarriedKind::Device(device.clone()),
+            EntryKind::Fifo => CarriedKind::Fifo,
+            EntryKind::Socket => CarriedKind::Socket,
+            _ => bail!("entry cannot be carried over from the previous archive"),
+        };
+
+        crate::report::entry(&self.path);
+        let parent_path = self.path.parent().unwrap_or(Path::new("")).to_path_buf();
+        self.cache.insert_carried(
+            CarriedEntry {
+                c_file_name,
+                metadata: entry.metadata().clone(),
+                kind,
+            },
+            &parent_path,
+        );
+
+        if let Some((previous, entries)) = directory {
+            self.carry_entries(encoder, &mut Some(previous), entries)
+                .await?;
+            if self.cache.caching_enabled() {
+                self.cache.insert_dir_end();
+            } else {
+                encoder.finish().await?;
+                if let Some(ref catalog) = self.catalog {
+                    catalog.lock().unwrap().end_directory()?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Writes an entry that was carried over, when the cache is emptied.
+    async fn encode_carried_entry<T: SeqWrite + Send>(
+        &mut self,
+        encoder: &mut Encoder<'_, T>,
+        entry: CarriedEntry,
+        base_offset: Option<PayloadOffset>,
+    ) -> Result<(), Error> {
+        let CarriedEntry {
+            c_file_name,
+            metadata,
+            kind,
+        } = entry;
+        let file_name: &Path = OsStr::from_bytes(c_file_name.to_bytes()).as_ref();
+        if let Some(ref catalog) = self.catalog {
+            let mut catalog = catalog.lock().unwrap();
+            match &kind {
+                CarriedKind::Directory => catalog.start_directory(&c_file_name)?,
+                CarriedKind::File { size, .. } => {
+                    catalog.add_file(&c_file_name, *size, metadata.stat.mtime.secs)?
+                }
+                CarriedKind::Symlink(_) => catalog.add_symlink(&c_file_name)?,
+                CarriedKind::Hardlink { .. } => catalog.add_hardlink(&c_file_name)?,
+                CarriedKind::Device(_) if metadata.file_type() == pxar::format::mode::IFBLK => {
+                    catalog.add_block_device(&c_file_name)?
+                }
+                CarriedKind::Device(_) => catalog.add_char_device(&c_file_name)?,
+                CarriedKind::Fifo => catalog.add_fifo(&c_file_name)?,
+                CarriedKind::Socket => catalog.add_socket(&c_file_name)?,
+            }
+        }
+        match kind {
+            CarriedKind::Directory => {
+                self.path.push(file_name);
+                encoder.create_directory(file_name, &metadata).await?;
+            }
+            CarriedKind::File {
+                size,
+                payload_offset,
+                link_target,
+            } => {
+                let base_offset = base_offset
+                    .context("a file carried over has no contents in the previous archive")?;
+                self.reuse_stats.total_reused_payload_size +=
+                    size + size_of::<pxar::format::Header>() as u64;
+                self.reuse_stats.files_reused_count += 1;
+                let offset = encoder
+                    .add_payload_ref(
+                        &metadata,
+                        file_name,
+                        size,
+                        payload_offset.add(base_offset.raw()),
+                    )
+                    .await?;
+                if let Some(index) = link_target {
+                    self.carried_files[index].1 = Some(offset);
+                }
+            }
+            CarriedKind::Hardlink { link_target, path } => {
+                let offset = self.carried_files[link_target]
+                    .1
+                    .context("a hard link carried over comes before its target")?;
+                self.reuse_stats.files_hardlink_count += 1;
+                encoder
+                    .add_hardlink(file_name, Path::new(&path), offset)
+                    .await?;
+            }
+            CarriedKind::Symlink(target) => {
+                encoder.add_symlink(&metadata, file_name, target).await?;
+            }
+            CarriedKind::Device(device) => {
+                encoder.add_device(&metadata, file_name, device).await?;
+            }
+            CarriedKind::Fifo => encoder.add_fifo(&metadata, file_name).await?,
+            CarriedKind::Socket => encoder.add_socket(&metadata, file_name).await?,
+        }
+        Ok(())
+    }
+
+    /// For a hard link in the previous archive: the place in `carried_files` of its target,
+    /// when that was carried over.
+    fn carried_link_target(&self, link: &FileEntry<MetadataArchiveReader>) -> Option<usize> {
+        let EntryKind::Hardlink(target) = link.kind() else {
+            return None;
+        };
+        let position = link
+            .entry_range_info()
+            .filename_header_offset?
+            .checked_sub(target.offset)?;
+        self.carried_files
+            .binary_search_by_key(&position, |(position, _)| *position)
+            .ok()
+    }
+
+    /// A file on disk with several links, in a directory that is read, was a hard link in
+    /// the previous archive, and its target there was carried over: the walk has not seen
+    /// the target and would store this file a second time. When the target on disk still is
+    /// the same file, note it, so that this one becomes a link to it again.
+    async fn note_carried_link_target<T: SeqWrite + Send>(
+        &mut self,
+        encoder: &mut Encoder<'_, T>,
+        previous: &Option<Directory<MetadataArchiveReader>>,
+        file_name: &Path,
+        stat: &FileStat,
+    ) -> Result<(), Error> {
+        let (Some(previous), Some(root)) = (previous, self.root.as_ref()) else {
+            return Ok(());
+        };
+        let Some(entry) = previous.lookup(file_name).await? else {
+            return Ok(());
+        };
+        let (EntryKind::Hardlink(target), Some(index)) =
+            (entry.kind(), self.carried_link_target(&entry))
+        else {
+            return Ok(());
+        };
+        let path = PathBuf::from(target.as_os_str());
+        let same = nix::sys::stat::fstatat(
+            Some(root.as_raw_fd()),
+            &path,
+            nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
+        )
+        .is_ok_and(|found| found.st_dev == stat.st_dev && found.st_ino == stat.st_ino);
+        if !same {
+            return Ok(());
+        }
+        if self.carried_files[index].1.is_none() {
+            // the target is among the cached entries: write them, to learn where it is
+            self.flush_cached_reusing_if_below_threshold(encoder, true)
+                .await?;
+        }
+        if let Some(offset) = self.carried_files[index].1 {
+            let link_info = HardLinkInfo {
+                st_dev: stat.st_dev as u64,
+                st_ino: stat.st_ino,
+            };
+            self.reuse_stats.files_hardlink_count += 1;
+            self.hardlinks.insert(link_info, (path, offset));
+        }
+        Ok(())
+    }
+
+    /// Opens the directory at `path` below the archived directory. None, with a warning, when
+    /// it is not there or may not be read: the list of changed directories named something
+    /// that is gone, which is fine, or left out a change above it.
+    fn open_below_root(&mut self, path: &Path) -> Result<Option<Dir>, Error> {
+        let root = self
+            .root
+            .as_ref()
+            .context("no archived directory to open below")?;
+        let path = if path.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            path
+        };
+        match proxmox_sys::fd::openat(
+            root,
+            path,
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(fd) => Ok(Some(Dir::from_fd(fd.into_raw_fd())?)),
+            Err(Errno::ENOENT | Errno::ENOTDIR | Errno::ELOOP) => {
+                warn!("named as changed, but not a directory any more: {path:?}");
+                Ok(None)
+            }
+            Err(Errno::EACCES | Errno::EPERM) => {
+                warn!("failed to open directory: {path:?}: access denied");
+                crate::report::warning(format!("not readable, left out: {path:?}"));
+                Ok(None)
+            }
+            Err(other) => Err(Error::from(other)).context(format!("failed to open {path:?}")),
+        }
+    }
+
+    /// Reads the entry at `self.path` from disk, in a directory that is otherwise carried
+    /// over. `parent` is that directory in the previous archive.
+    async fn add_entry_from_disk<T: SeqWrite + Send>(
+        &mut self,
+        encoder: &mut Encoder<'_, T>,
+        parent: &mut Option<Directory<MetadataArchiveReader>>,
+        c_file_name: &CStr,
+    ) -> Result<(), Error> {
+        let parent_path = self.path.parent().unwrap_or(Path::new("")).to_path_buf();
+        let Some(dir) = self.open_below_root(&parent_path)? else {
+            return Ok(());
+        };
+        let stat = match nix::sys::stat::fstatat(
+            Some(dir.as_raw_fd()),
+            c_file_name,
+            nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
+        ) {
+            Ok(stat) => stat,
+            Err(Errno::ENOENT) => {
+                warn!("named as changed, but not there any more: {:?}", self.path);
+                return Ok(());
+            }
+            Err(err) => return Err(err).context(format!("stat failed on {:?}", self.path)),
+        };
+        self.add_entry(encoder, parent, dir.as_raw_fd(), c_file_name, &stat)
+            .await
     }
 
     async fn add_regular_file<T: SeqWrite + Send>(

@@ -14,6 +14,11 @@ What is tested:
   catalog extract    one folder and one file, each into an empty target, with their metadata
   change detection   a second run over an unchanged tree in which every file carries an
                      extended attribute reuses everything and uploads no file data
+  changed dirs       with --changed-dirs only the directories named as changed are read; the
+                     others are carried over from the previous snapshot, with their attributes,
+                     and are provably not looked at; a restore equals the source after one and
+                     after two such runs; an 'r' record rereads everything below it; a list
+                     relative to another snapshot, or without a previous one, is ignored
   progress records   --progress-json prints a record at least every two seconds and a final
                      record that names the snapshot the server then lists
   exclusions         --skip-tm-excluded leaves out what carries the Time Machine exclusion
@@ -582,6 +587,162 @@ def test_change_detection(server, work, state):
     return f"40 of 40 files with attributes reused, {uploaded} of padding uploaded"
 
 
+def human_bytes(text):
+    """'1.5 MiB' as a number of bytes."""
+    number, unit = text.split()
+    return float(number) * 1024 ** ["B", "KiB", "MiB", "GiB", "TiB"].index(unit)
+
+
+def test_changed_dirs(server, work, state):
+    tree, restored = os.path.join(work, "changing"), os.path.join(work, "changing-restored")
+    j = lambda *parts: os.path.join(tree, *parts)
+    for folder in ("a/deep/deeper", "b/sub", "c", "links", "names/nfd", "quiet/inner", "rec/r1/r2"):
+        os.makedirs(j(folder))
+    files = ["top.bin", "a/a1.bin", "a/a2.bin", "a/deep/d1.bin", "a/deep/d2.bin", "a/deep/deeper/x.bin",
+             "b/b1.bin", "b/sub/s1.bin", "c/c1.bin", "c/c2.bin", "rec/r1/r2/deep.bin",
+             "names/nfd/" + unicodedata.normalize("NFD", "été à Zürich.txt")]
+    for name in files:
+        write(j(name), os.urandom(40_000))
+        set_xattr(j(name), "com.apple.quarantine", b"0083;65a1b2c3;Safari;" + name.encode())
+    for name in ("quiet/q1.bin", "quiet/q2.bin", "quiet/inner/q3.bin"):     # most of the data
+        write(j(name), os.urandom(2_000_000))
+        set_xattr(j(name), "com.apple.metadata:_kMDItemUserTags", plistlib.dumps(["Red\n6"], fmt=plistlib.FMT_BINARY))
+    write(j("b/with-fork.bin"), b"data fork\n")
+    write(j("b/with-fork.bin", "..namedfork", "rsrc"), os.urandom(1_600_000))
+    os.symlink("b1.bin", j("b/symlink"))
+    # Hard links: within a folder, and across folders of which, in the second run, both are
+    # carried over, only the target is, or only the link is.
+    write(j("links/link-a"), os.urandom(40_000))
+    os.link(j("links/link-a"), j("links/link-b"))
+    for target, link in (("quiet/inner/t1.bin", "rec/r1/l1"), ("a/deep/deeper/t2.bin", "c/l2"),
+                         ("b/sub/t3.bin", "quiet/l3")):
+        write(j(target), os.urandom(40_000))
+        os.link(j(target), j(link))
+    time.sleep(1.1)     # a change within the same second as the backup is not what is tested
+
+    def run(base, *records):
+        """Backs up with a change list of (kind, path) relative to `base`; returns the result record."""
+        listing = os.path.join(work, "changed-dirs")
+        write(listing, b"".join(kind.encode() + os.fsencode(path) + b"\0" for kind, path in records))
+        snapshot, log = server.backup("pbs-client-test-changed", "tree.pxar", tree,
+                                      "--change-detection-mode=metadata", "--progress-json", "true",
+                                      "--changed-dirs", listing, "--changed-dirs-base", base.split("/")[-1])
+        result = server.records[-1]
+        result["log"] = log
+        return snapshot, result
+
+    def same_as_source(snapshot, what):
+        remove(restored)
+        server.run("restore", snapshot, "tree.pxar", restored)
+        diffs, count = compare(tree, restored, SYSTEM_ATTRIBUTES)
+        check(not diffs, f"{what}: {len(diffs)} differences after restore: " + "; ".join(diffs[:5]))
+        return count
+
+    def restored_file(snapshot, path):
+        target = os.path.join(work, "changing-one")
+        remove(target)
+        server.run("catalog", "extract", snapshot, "tree.pxar", path, target)
+        return sha256_file(os.path.join(target, os.path.basename(path)))
+
+    # No previous snapshot: the list cannot be used, everything is read.
+    first, result = run("host/x/2020-01-01T00:00:00Z", ("d", j("a")))
+    check(result["change_list"].startswith("ignored") and result["carried_dirs"] == 0,
+          f"first backup: change list {result['change_list']}, {result['carried_dirs']} carried")
+    same_as_source(first, "first backup")
+
+    # A file changed in place, one added, one deleted, the mode of two folders changed.
+    write(j("a/deep/d1.bin"), os.urandom(40_000))
+    write(j("c/new.bin"), os.urandom(40_000))
+    set_xattr(j("c/new.bin"), "org.example.new", b"new attribute value")
+    os.remove(j("a/a1.bin"))
+    os.chmod(j("names"), 0o700)       # reported for its parent, the root
+    os.chmod(j("b/sub"), 0o700)       # reported for the folder itself
+    second, result = run(first, ("d", j("a/deep")), ("d", os.path.realpath(j("c"))), ("d", j("a")),
+                         ("d", tree), ("d", j("b/sub")), ("d", j("gone/never/was")), ("d", "/elsewhere"))
+    check(result["change_list"] == "used", f"second backup: change list {result['change_list']}")
+    check(result["carried_dirs"] >= 8, f"only {result['carried_dirs']} directories carried over")
+    check(result["walked_dirs"] <= 8, f"{result['walked_dirs']} directories read")
+    payload = next(line for line in result["log"].splitlines() if line.startswith("tree.ppxar: had to backup "))
+    uploaded = human_bytes(payload.split("had to backup ")[-1].split(" of ")[0])
+    check(uploaded < 1_000_000, f"carried files were uploaded again: {payload}")
+    count = same_as_source(second, "second backup")
+    _, out, _ = server.run("catalog", "list", second, "tree.pxar", "--recursive", "true")
+    listed = len(out.splitlines())
+    check(listed == count - 1, f"the listing has {listed} entries, the tree {count - 1}")
+
+    # A third run on top of one that carried directories over; and an 'r' record: a change deep
+    # below it, in a folder not named itself, is picked up.
+    # A new folder that the list names while it leaves out the folder it was made in: that
+    # one is read all the same.
+    write(j("rec/r1/r2/deep.bin"), os.urandom(40_000))
+    write(j("b/b1.bin"), os.urandom(40_000))
+    os.makedirs(j("names/nfd/made/since"))
+    write(j("names/nfd/made/since/late.bin"), os.urandom(1_000))
+    third, result = run(second, ("r", j("rec")), ("d", j("b")), ("d", j("names/nfd/made/since")))
+    check(result["change_list"] == "used" and result["carried_dirs"] >= 6,
+          f"third backup: change list {result['change_list']}, {result['carried_dirs']} carried")
+    same_as_source(third, "third backup")
+
+    # What is not named is not looked at: a folder that cannot even be opened is carried over,
+    # and a file replaced behind the list's back keeps its previous contents in the snapshot.
+    before = sha256_file(j("quiet/q1.bin"))
+    stamp = os.stat(j("quiet/q1.bin"))
+    write(j("quiet/q1.bin"), os.urandom(2_000_000))
+    os.utime(j("quiet/q1.bin"), ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+    os.chmod(j("quiet/inner"), 0)
+    try:
+        fourth, result = run(third, ("d", j("c")))
+    finally:
+        os.chmod(j("quiet/inner"), 0o755)
+    check(result["change_list"] == "used" and not result["warnings"],
+          f"fourth backup: change list {result['change_list']}, warnings {result['warnings']}")
+    check(restored_file(fourth, "quiet/q1.bin") == before, "an unnamed folder was read from disk")
+    check(restored_file(fourth, "quiet/inner/q3.bin") == sha256_file(j("quiet/inner/q3.bin")),
+          "a folder that was not readable is not carried over whole")
+
+    # A list relative to another snapshot than the previous one: ignored, everything is read.
+    # The replaced file has its old size and dates, so only its contents tell; a full walk in
+    # metadata mode trusts those too. Give it a new date, as any real change would.
+    os.utime(j("quiet/q1.bin"))
+    fifth, result = run(second, ("d", j("c")))
+    check(result["change_list"].startswith("ignored") and result["carried_dirs"] == 0,
+          f"wrong base: change list {result['change_list']}, {result['carried_dirs']} carried")
+    same_as_source(fifth, "backup with a list for another snapshot")
+
+    # More entries than are held back at once while carrying over, in folders nothing names.
+    many, listing = os.path.join(work, "many"), os.path.join(work, "changed-dirs")
+    for folder in ("one", "one/two", "three"):
+        os.makedirs(os.path.join(many, folder))
+        for number in range(3000):
+            write(os.path.join(many, folder, f"file-{number:04d}"), b"%d" % number)
+    time.sleep(1.1)
+    options = ("--change-detection-mode=metadata", "--progress-json", "true")
+    full, _ = server.backup("pbs-client-test-changed-many", "many.pxar", many, *options)
+    write(os.path.join(many, "three", "file-1500"), b"changed")
+    write(listing, b"d" + os.fsencode(os.path.join(many, "three")) + b"\0")
+    carried, _ = server.backup("pbs-client-test-changed-many", "many.pxar", many, *options,
+                               "--changed-dirs", listing, "--changed-dirs-base", full.split("/")[-1])
+    result = server.records[-1]
+    check(result["change_list"] == "used" and result["carried_dirs"] == 2 and result["walked_dirs"] == 2,
+          f"many entries: {result['carried_dirs']} carried, {result['walked_dirs']} read")
+    remove(restored)
+    server.run("restore", carried, "many.pxar", restored)
+    diffs, many_count = compare(many, restored, SYSTEM_ATTRIBUTES)
+    check(not diffs, f"many entries: {len(diffs)} differences after restore: " + "; ".join(diffs[:5]))
+
+    # A list without the snapshot it is relative to, and a file that is no list, are refused.
+    status, _, err = server.run("backup", f"tree.pxar:{tree}", "--backup-id", "pbs-client-test-changed",
+                                "--changed-dirs", listing, ok=False)
+    check(status != 0 and "only used together" in err, f"a list without its base gave status {status}")
+    write(listing, b"x/not/a/record\0")
+    status, _, err = server.run("backup", f"tree.pxar:{tree}", "--backup-id", "pbs-client-test-changed",
+                                "--changed-dirs", listing, "--changed-dirs-base", fifth.split("/")[-1], ok=False)
+    check(status != 0 and "unknown record kind" in err, f"a file that is no list gave status {status}")
+    return (f"{count} entries identical after one and two carried runs, hard links kept; an unreadable "
+            f"and a silently replaced folder carried over; {many_count} entries carried in one go; "
+            f"wrong base ignored")
+
+
 def test_progress_records(server, work, state):
     tree = os.path.join(work, "slow")
     os.makedirs(tree)
@@ -781,7 +942,7 @@ def run_all():
         server = Server(work)
         state = {}
         for test in (test_round_trip, test_catalog_list, test_catalog_extract, test_change_detection,
-                     test_progress_records, test_time_machine_exclusions, test_unreadable_files,
+                     test_changed_dirs, test_progress_records, test_time_machine_exclusions, test_unreadable_files,
                      test_placeholders, test_mount, test_without_fuse_t):
             name = test.__name__[5:].replace("_", " ")
             try:
