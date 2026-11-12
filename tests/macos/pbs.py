@@ -17,6 +17,8 @@ What is tested:
                      record that names the snapshot the server then lists
   exclusions         --skip-tm-excluded leaves out what carries the Time Machine exclusion
                      attribute, with everything below it, and counts it
+  unreadable files   a file that may not be opened is left out and named in the result; the
+                     backup still succeeds
   placeholders       --skip-placeholders leaves out files whose contents are not on disk and
                      names them; without it the backup fails (needs PBS_TEST_PLACEHOLDER_DIR)
 
@@ -614,6 +616,24 @@ def test_time_machine_exclusions(server, work, state):
     return "a marked folder with its contents and a marked file left out and counted as 2"
 
 
+def test_unreadable_files(server, work, state):
+    tree = os.path.join(work, "guarded")
+    os.makedirs(tree)
+    write(os.path.join(tree, "open.txt"), b"readable")
+    write(os.path.join(tree, "closed.txt"), b"not readable")
+    os.chmod(os.path.join(tree, "closed.txt"), 0)
+    try:
+        snapshot, _ = server.backup("pbs-client-test-unreadable", "tree.pxar", tree, "--progress-json", "true")
+    finally:
+        os.chmod(os.path.join(tree, "closed.txt"), 0o600)
+    result = server.records[-1]
+    check(result["ok"] is True, "the backup failed because of one unreadable file")
+    check(any("closed.txt" in warning for warning in result["warnings"]), f"warnings are {result['warnings']}")
+    _, root, _ = server.listing(snapshot, "tree.pxar")
+    check([entry["name"] for entry in root] == ["open.txt"], f"snapshot holds {[entry['name'] for entry in root]}")
+    return "one unreadable file left out and named, the rest backed up"
+
+
 def test_placeholders(server, work, state):
     folder = server.env.get("PBS_TEST_PLACEHOLDER_DIR")
     if not folder:
@@ -648,7 +668,8 @@ def run_all():
         server = Server(work)
         state = {}
         for test in (test_round_trip, test_catalog_list, test_catalog_extract, test_change_detection,
-                     test_progress_records, test_time_machine_exclusions, test_placeholders):
+                     test_progress_records, test_time_machine_exclusions, test_unreadable_files,
+                     test_placeholders):
             name = test.__name__[5:].replace("_", " ")
             try:
                 outcome = test(server, work, state)

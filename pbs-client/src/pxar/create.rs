@@ -569,6 +569,7 @@ impl Archiver {
                 }
                 Err(Errno::EACCES) => {
                     warn!("failed to open file: {:?}: access denied", file_name);
+                    crate::report::warning(format!("not readable, left out: {:?}", self.path));
                     Ok(None)
                 }
                 Err(Errno::ESTALE) => {
@@ -579,6 +580,16 @@ impl Archiver {
                     // Retry without O_NOATIME:
                     noatime = OFlag::empty();
                     continue;
+                }
+                // macOS answers "operation not permitted" for what its privacy protection
+                // guards, even with Full Disk Access for some files. Like a file without
+                // read permission, such a file is left out and reported; it does not end
+                // the backup.
+                #[cfg(target_os = "macos")]
+                Err(Errno::EPERM) => {
+                    warn!("failed to open file: {:?}: operation not permitted", file_name);
+                    crate::report::warning(format!("not readable, left out: {:?}", self.path));
+                    Ok(None)
                 }
                 Err(other) => Err(Error::from(other)),
             };
@@ -929,6 +940,12 @@ impl Archiver {
             Err(err) => {
                 if let Some(Errno::ESTALE) = err.downcast_ref::<Errno>() {
                     self.report_stale_file_handle(None);
+                    return Ok(());
+                }
+                #[cfg(target_os = "macos")]
+                if let Some(Errno::EPERM | Errno::EACCES) = err.downcast_ref::<Errno>() {
+                    warn!("failed to read metadata: {:?}: {err}", self.path);
+                    crate::report::warning(format!("not readable, left out: {:?}", self.path));
                     return Ok(());
                 }
                 return Err(err);
