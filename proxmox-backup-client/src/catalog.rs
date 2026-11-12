@@ -293,6 +293,265 @@ async fn catalog_shell(param: Value) -> Result<(), Error> {
     Ok(())
 }
 
+#[api(
+    input: {
+        properties: {
+            "snapshot": {
+                type: String,
+                description: "Group/Snapshot path.",
+            },
+            "archive-name": {
+                type: BackupArchiveName,
+            },
+            "path": {
+                type: String,
+                description: "Directory inside the archive, relative to its root. Defaults to the root.",
+                optional: true,
+            },
+            repo: {
+                type: BackupTargetArgs,
+                flatten: true,
+            },
+            "keyfile": {
+                optional: true,
+                type: String,
+                description: "Path to encryption key.",
+            },
+            "keyfd": {
+                schema: KEYFD_SCHEMA,
+                optional: true,
+            },
+            "ignore-missing-signature": {
+                schema: IGNORE_MISSING_SIGNATURE_SCHEMA,
+                optional: true,
+            },
+         },
+    },
+)]
+/// List the entries of one directory of a snapshot archive as JSON.
+///
+/// Prints one JSON array on standard output. Each element has `name`, `type` (`directory`,
+/// `file`, `symlink`, `hardlink` or `other`), `mtime` (seconds since the epoch) and, for
+/// files, `size` in bytes. Only the metadata of that directory is read: no file contents are
+/// downloaded and nothing is mounted. Works for encrypted snapshots with the key.
+async fn catalog_list(param: Value) -> Result<(), Error> {
+    let repo = extract_repository_from_value(&param)?;
+    let client = connect(&repo)?;
+    let backup_ns = optional_ns_param(&param)?;
+    let snapshot = required_string_param(&param, "snapshot")?;
+    let server_archive_name: BackupArchiveName =
+        required_string_param(&param, "archive-name")?.try_into()?;
+    let path = param["path"].as_str().unwrap_or("").trim_matches('/');
+
+    let backup_dir = dir_or_last_from_group(&client, &repo, &backup_ns, snapshot).await?;
+
+    let crypto = crypto_parameters(&param)?;
+    let crypt_config = match crypto.enc_key {
+        None => None,
+        Some(key) => {
+            let (key, _created, _fingerprint) = decrypt_key(&key.key, &get_encryption_key_password)
+                .inspect_err(|_err| {
+                    log::error!("{}", format_key_source(&key.source, "encryption"));
+                })?;
+            Some(Arc::new(CryptConfig::new(key)?))
+        }
+    };
+
+    if !server_archive_name.has_pxar_filename_extension() {
+        bail!("Can only list pxar archives.");
+    };
+
+    let client = BackupReader::start(
+        &client,
+        crypt_config.clone(),
+        repo.store(),
+        &backup_ns,
+        &backup_dir,
+        true,
+    )
+    .await?;
+
+    let ignore_missing_signature = param["ignore-missing-signature"].as_bool().unwrap_or(false);
+    let (manifest, _) = client.download_manifest(ignore_missing_signature).await?;
+    manifest.check_fingerprint(crypt_config.as_ref().map(Arc::as_ref))?;
+
+    let accessor =
+        helper::get_pxar_fuse_accessor(&server_archive_name, client.clone(), &manifest, crypt_config)
+            .await?;
+
+    let root = accessor.open_root().await?;
+    let directory = if path.is_empty() {
+        root
+    } else {
+        let entry = root
+            .lookup(path)
+            .await?
+            .ok_or_else(|| format_err!("no such path in {server_archive_name}: {path}"))?;
+        if !entry.is_dir() {
+            bail!("not a directory in {server_archive_name}: {path}");
+        }
+        entry.enter_directory().await?
+    };
+
+    let mut list = Vec::new();
+    let mut entries = directory.read_dir();
+    while let Some(entry) = entries.next().await {
+        let entry = entry?.decode_entry().await?;
+        let kind = if entry.is_dir() {
+            "directory"
+        } else if entry.is_symlink() {
+            "symlink"
+        } else if entry.is_hardlink() {
+            "hardlink"
+        } else if entry.is_regular_file() {
+            "file"
+        } else {
+            "other"
+        };
+        let mut item = serde_json::json!({
+            "name": entry.file_name().to_string_lossy(),
+            "type": kind,
+            "mtime": entry.metadata().stat.mtime.secs,
+        });
+        if let Some(size) = entry.file_size() {
+            item["size"] = size.into();
+        }
+        list.push(item);
+    }
+    list.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+    println!("{}", serde_json::to_string(&list)?);
+
+    record_repository(&repo);
+
+    Ok(())
+}
+
+#[api(
+    input: {
+        properties: {
+            "snapshot": {
+                type: String,
+                description: "Group/Snapshot path.",
+            },
+            "archive-name": {
+                type: BackupArchiveName,
+            },
+            "path": {
+                type: String,
+                description: "File or directory inside the archive, relative to its root.",
+            },
+            "target": {
+                type: String,
+                description: "Directory to extract into. It is created if missing.",
+            },
+            repo: {
+                type: BackupTargetArgs,
+                flatten: true,
+            },
+            "keyfile": {
+                optional: true,
+                type: String,
+                description: "Path to encryption key.",
+            },
+            "keyfd": {
+                schema: KEYFD_SCHEMA,
+                optional: true,
+            },
+            "ignore-missing-signature": {
+                schema: IGNORE_MISSING_SIGNATURE_SCHEMA,
+                optional: true,
+            },
+         },
+    },
+)]
+/// Extract one file or directory of a snapshot archive into a target directory.
+///
+/// Unlike `restore --pattern`, which reads the whole archive from start to end, this goes
+/// straight to the entry, so the time depends on the size of what is extracted and not on
+/// the size of the snapshot. The entry appears in the target under its own name.
+async fn catalog_extract(param: Value) -> Result<(), Error> {
+    let repo = extract_repository_from_value(&param)?;
+    let client = connect(&repo)?;
+    let backup_ns = optional_ns_param(&param)?;
+    let snapshot = required_string_param(&param, "snapshot")?;
+    let server_archive_name: BackupArchiveName =
+        required_string_param(&param, "archive-name")?.try_into()?;
+    let path = required_string_param(&param, "path")?.trim_matches('/').to_owned();
+    let target = required_string_param(&param, "target")?.to_owned();
+    if path.is_empty() {
+        bail!("no path given");
+    }
+
+    let backup_dir = dir_or_last_from_group(&client, &repo, &backup_ns, snapshot).await?;
+
+    let crypto = crypto_parameters(&param)?;
+    let crypt_config = match crypto.enc_key {
+        None => None,
+        Some(key) => {
+            let (key, _created, _fingerprint) = decrypt_key(&key.key, &get_encryption_key_password)
+                .inspect_err(|_err| {
+                    log::error!("{}", format_key_source(&key.source, "encryption"));
+                })?;
+            Some(Arc::new(CryptConfig::new(key)?))
+        }
+    };
+
+    if !server_archive_name.has_pxar_filename_extension() {
+        bail!("Can only extract from pxar archives.");
+    };
+
+    let client = BackupReader::start(
+        &client,
+        crypt_config.clone(),
+        repo.store(),
+        &backup_ns,
+        &backup_dir,
+        true,
+    )
+    .await?;
+
+    let ignore_missing_signature = param["ignore-missing-signature"].as_bool().unwrap_or(false);
+    let (manifest, _) = client.download_manifest(ignore_missing_signature).await?;
+    manifest.check_fingerprint(crypt_config.as_ref().map(Arc::as_ref))?;
+
+    let accessor = helper::get_pxar_fuse_accessor(
+        &server_archive_name,
+        client.clone(),
+        &manifest,
+        crypt_config.clone(),
+    )
+    .await?;
+
+    if accessor.open_root().await?.lookup(&path).await?.is_none() {
+        bail!("no such path in {server_archive_name}: {path}");
+    }
+
+    #[cfg(target_os = "macos")]
+    let native_payloads = {
+        let (primary, _) = pbs_client::tools::get_pxar_archive_names(&server_archive_name, &manifest)?;
+        crate::restore_native_payloads(client.clone(), &manifest, crypt_config, &primary, false).await?
+    };
+
+    // The macOS metadata of an entry is looked up through a per-thread slot, so the whole
+    // extraction is driven from this one thread.
+    let extract = || {
+        tokio::runtime::Handle::current().block_on(pbs_client::pxar::extract_sub_dir(
+            &target, accessor, &path,
+        ))
+    };
+    #[cfg(target_os = "macos")]
+    let extracted = tokio::task::block_in_place(|| {
+        pbs_client::pxar::darwin_archive::with_restore_payloads(native_payloads, extract)
+    });
+    #[cfg(not(target_os = "macos"))]
+    let extracted = tokio::task::block_in_place(extract);
+    extracted.map_err(|err| format_err!("error extracting {path} - {err:#}"))?;
+
+    record_repository(&repo);
+
+    Ok(())
+}
+
 pub fn catalog_mgmt_cli() -> CliCommandMap {
     let catalog_shell_cmd_def = CliCommand::new(&API_METHOD_CATALOG_SHELL)
         .arg_param(&["snapshot", "archive-name"])
@@ -307,7 +566,23 @@ pub fn catalog_mgmt_cli() -> CliCommandMap {
         .completion_cb("ns", complete_namespace)
         .completion_cb("snapshot", complete_backup_snapshot);
 
+    let catalog_list_cmd_def = CliCommand::new(&API_METHOD_CATALOG_LIST)
+        .arg_param(&["snapshot", "archive-name", "path"])
+        .completion_cb("repository", complete_repository)
+        .completion_cb("ns", complete_namespace)
+        .completion_cb("archive-name", complete_pxar_archive_name)
+        .completion_cb("snapshot", complete_group_or_snapshot);
+
+    let catalog_extract_cmd_def = CliCommand::new(&API_METHOD_CATALOG_EXTRACT)
+        .arg_param(&["snapshot", "archive-name", "path", "target"])
+        .completion_cb("repository", complete_repository)
+        .completion_cb("ns", complete_namespace)
+        .completion_cb("archive-name", complete_pxar_archive_name)
+        .completion_cb("snapshot", complete_group_or_snapshot);
+
     CliCommandMap::new()
         .insert("dump", catalog_dump_cmd_def)
+        .insert("extract", catalog_extract_cmd_def)
+        .insert("list", catalog_list_cmd_def)
         .insert("shell", catalog_shell_cmd_def)
 }

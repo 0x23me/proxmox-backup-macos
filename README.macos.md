@@ -57,6 +57,37 @@ The [Homebrew formula](Formula/proxmox-backup-client.rb) contains the build reci
 a fresh Homebrew build/install on Apple Silicon and subsequent encrypted and
 unencrypted PBS backup/restore using the installed executable have passed.
 
+With [just](https://github.com/casey/just) the same steps are one command each:
+
+```sh
+git submodule update --init
+just build      # native-target/release/proxmox-backup-client
+just test       # tests that need no server
+just test-pbs   # round trip, listing, extracting and change detection against a PBS namespace
+```
+
+`scripts/macos/cargo.sh` is what the recipes call. It applies the dependency patches, starts
+Cargo outside the source tree and with an empty environment that puts Apple's linker and `strip`
+first; inside a nix or devenv shell the build otherwise fails with
+`can't find crate for <a procedural macro>`. Rust comes from `PATH`, or from nixpkgs if there is
+none. `tests/macos/pbs.py` names the environment variables `just test-pbs` needs: a repository,
+a namespace and a token with `DatastoreBackup` on it.
+
+Two commands exist only in this fork, for programs that browse a snapshot without mounting it.
+Both work on encrypted snapshots and read only what they return:
+
+```sh
+# one directory as JSON: [{"name": "...", "type": "file", "size": 70000, "mtime": 1700000000}, ...]
+proxmox-backup-client catalog list <snapshot> documents.pxar [<directory>] --ns laptops
+
+# one file or directory, with its Mac metadata, into a target directory
+proxmox-backup-client catalog extract <snapshot> documents.pxar <path> /restore --ns laptops
+```
+
+`type` is `directory`, `file`, `symlink`, `hardlink` or `other`; `size` is present for files;
+`mtime` is in seconds since the epoch. `restore --pattern` gives the same result as
+`catalog extract` but reads the whole archive to get there.
+
 The CLI retains the Linux syntax, for example:
 
 ```sh
