@@ -83,6 +83,9 @@ Both work on encrypted snapshots and read only what they return:
 # one directory as JSON: [{"name": "...", "type": "file", "size": 70000, "mtime": 1700000000}, ...]
 proxmox-backup-client catalog list <snapshot> documents.pxar [<directory>] --ns laptops
 
+# everything below a directory, one JSON object per line, each with its "path" (to search by name)
+proxmox-backup-client catalog list <snapshot> documents.pxar [<directory>] --recursive true --ns laptops
+
 # one file or directory, with its Mac metadata, into a target directory
 proxmox-backup-client catalog extract <snapshot> documents.pxar <path> /restore --ns laptops
 ```

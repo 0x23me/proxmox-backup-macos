@@ -293,6 +293,32 @@ async fn catalog_shell(param: Value) -> Result<(), Error> {
     Ok(())
 }
 
+/// What `catalog list` prints of one entry.
+fn describe_entry<T: Clone + pxar::accessor::ReadAt>(
+    entry: &pxar::accessor::aio::FileEntry<T>,
+) -> Value {
+    let kind = if entry.is_dir() {
+        "directory"
+    } else if entry.is_symlink() {
+        "symlink"
+    } else if entry.is_hardlink() {
+        "hardlink"
+    } else if entry.is_regular_file() {
+        "file"
+    } else {
+        "other"
+    };
+    let mut item = serde_json::json!({
+        "name": entry.file_name().to_string_lossy(),
+        "type": kind,
+        "mtime": entry.metadata().stat.mtime.secs,
+    });
+    if let Some(size) = entry.file_size() {
+        item["size"] = size.into();
+    }
+    item
+}
+
 #[api(
     input: {
         properties: {
@@ -307,6 +333,12 @@ async fn catalog_shell(param: Value) -> Result<(), Error> {
                 type: String,
                 description: "Directory inside the archive, relative to its root. Defaults to the root.",
                 optional: true,
+            },
+            "recursive": {
+                type: Boolean,
+                description: "List everything below the directory, one JSON object per line, each with its `path`.",
+                optional: true,
+                default: false,
             },
             repo: {
                 type: BackupTargetArgs,
@@ -334,6 +366,10 @@ async fn catalog_shell(param: Value) -> Result<(), Error> {
 /// `file`, `symlink`, `hardlink` or `other`), `mtime` (seconds since the epoch) and, for
 /// files, `size` in bytes. Only the metadata of that directory is read: no file contents are
 /// downloaded and nothing is mounted. Works for encrypted snapshots with the key.
+///
+/// With `--recursive true` everything below the directory is printed instead, one JSON object
+/// per line and in no particular order, each with the additional field `path` (relative to
+/// the archive root). This is what a program needs to search a snapshot by name.
 async fn catalog_list(param: Value) -> Result<(), Error> {
     let repo = extract_repository_from_value(&param)?;
     let client = connect(&repo)?;
@@ -393,30 +429,37 @@ async fn catalog_list(param: Value) -> Result<(), Error> {
         entry.enter_directory().await?
     };
 
+    if param["recursive"].as_bool().unwrap_or(false) {
+        let mut pending = vec![(directory, path.to_string())];
+        while let Some((directory, prefix)) = pending.pop() {
+            let mut lines = String::new();
+            let mut entries = directory.read_dir();
+            while let Some(entry) = entries.next().await {
+                let entry = entry?.decode_entry().await?;
+                let name = entry.file_name().to_string_lossy();
+                let full = if prefix.is_empty() {
+                    name.into_owned()
+                } else {
+                    format!("{prefix}/{name}")
+                };
+                let mut item = describe_entry(&entry);
+                item["path"] = full.as_str().into();
+                lines.push_str(&serde_json::to_string(&item)?);
+                lines.push('\n');
+                if entry.is_dir() {
+                    pending.push((entry.enter_directory().await?, full));
+                }
+            }
+            print!("{lines}");
+        }
+        record_repository(&repo);
+        return Ok(());
+    }
+
     let mut list = Vec::new();
     let mut entries = directory.read_dir();
     while let Some(entry) = entries.next().await {
-        let entry = entry?.decode_entry().await?;
-        let kind = if entry.is_dir() {
-            "directory"
-        } else if entry.is_symlink() {
-            "symlink"
-        } else if entry.is_hardlink() {
-            "hardlink"
-        } else if entry.is_regular_file() {
-            "file"
-        } else {
-            "other"
-        };
-        let mut item = serde_json::json!({
-            "name": entry.file_name().to_string_lossy(),
-            "type": kind,
-            "mtime": entry.metadata().stat.mtime.secs,
-        });
-        if let Some(size) = entry.file_size() {
-            item["size"] = size.into();
-        }
-        list.push(item);
+        list.push(describe_entry(&entry?.decode_entry().await?));
     }
     list.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
     println!("{}", serde_json::to_string(&list)?);

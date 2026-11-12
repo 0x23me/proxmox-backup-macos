@@ -9,7 +9,8 @@ What is tested:
                      contents, names byte for byte, modes, owners, BSD flags, modification and
                      creation times, every extended attribute including the resource fork,
                      ACLs, link targets and hard links
-  catalog list       one directory as JSON: root, nested path, missing path
+  catalog list       one directory as JSON: root, nested path, missing path; and everything
+                     below a directory with --recursive
   catalog extract    one folder and one file, each into an empty target, with their metadata
   change detection   a second run over an unchanged tree in which every file carries an
                      extended attribute reuses everything and uploads no file data
@@ -511,17 +512,35 @@ def test_catalog_list(server, work, state):
     check(status != 0 and "not a directory" in err, f"a file as path gave status {status}")
     check(elapsed < 5, f"root listing took {elapsed:.1f} s")
 
+    def everything(snapshot, archive, *path, **kwargs):
+        _, out, _ = server.run("catalog", "list", snapshot, archive, *path, "--recursive", "true", **kwargs)
+        return [json.loads(line) for line in out.splitlines()]
+
+    expected = {os.path.relpath(os.path.join(folder, name), state["src"])
+                for folder, folders, files in os.walk(state["src"]) for name in folders + files}
+    listed = everything(snapshot, "fixture.pxar")
+    check({entry["path"] for entry in listed} == expected and len(listed) == len(expected),
+          f"the recursive listing has {len(listed)} entries, the source {len(expected)}")
+    check(all(entry["path"].split("/")[-1] == entry["name"] for entry in listed), "a path does not end in its name")
+    below = everything(snapshot, "fixture.pxar", "names")
+    check({entry["path"] for entry in below} == {path for path in expected if path.startswith("names/")},
+          f"the recursive listing below names/ is {sorted(entry['path'] for entry in below)}")
+
     large = server.env.get("PBS_TEST_LARGE")
     if not large:
-        return f"root, nested, missing path ok; root in {elapsed:.2f} s (no large snapshot given)"
+        return (f"root, nested, missing path ok; root in {elapsed:.2f} s; all {len(listed)} entries "
+                "recursively (no large snapshot given)")
     large_snapshot, large_archive = large.split()
+    keyfile = os.path.expanduser(server.env["PBS_TEST_LARGE_KEYFILE"])
     started = time.monotonic()
-    _, entries, _ = server.listing(large_snapshot, large_archive,
-                                   keyfile=os.path.expanduser(server.env["PBS_TEST_LARGE_KEYFILE"]))
+    _, entries, _ = server.listing(large_snapshot, large_archive, keyfile=keyfile)
     large_elapsed = time.monotonic() - started
     check(large_elapsed < 5, f"listing the large snapshot took {large_elapsed:.1f} s")
+    started = time.monotonic()
+    count = len(everything(large_snapshot, large_archive, keyfile=keyfile))
     return (f"root, nested, missing path ok; root in {elapsed:.2f} s; "
-            f"{len(entries)} entries of {large_snapshot} in {large_elapsed:.2f} s")
+            f"{len(entries)} entries of {large_snapshot} in {large_elapsed:.2f} s, "
+            f"all {count} recursively in {time.monotonic() - started:.2f} s")
 
 
 def test_catalog_extract(server, work, state):
