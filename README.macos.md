@@ -44,13 +44,16 @@ backup data. Linux format and compilation regressions are checked separately.
 [Native metadata design and limits](docs/macos-native-metadata.md) describes the
 versioned envelope and additional standard PXAR archive. The server and PXAR
 wire formats are unchanged. The native client restores the associated metadata
-automatically with the ordinary `restore` command. FUSE mount/map remain Linux-only.
+automatically with the ordinary `restore` command. `mount` works through FUSE-T (see
+[Mounting an archive](#mounting-an-archive)); `map` and `unmap` remain Linux-only.
 Intel and older macOS versions have not been verified.
 
 ## Build and use
 
 Build prerequisites are Rust, OpenSSL 3, zstd and pkg-config (Homebrew packages
-`rust`, `openssl@3`, `zstd`, `pkgconf`). Initialize pinned Git submodules and run
+`rust`, `openssl@3`, `zstd`, `pkgconf`) and [FUSE-T](https://www.fuse-t.org)
+(`brew install --cask fuse-t`), whose headers and library the build needs; this applies to the
+Homebrew formula too. The built client runs without FUSE-T. Initialize pinned Git submodules and run
 `python3 scripts/macos/apply-patches.py`. Cargo must run from outside the source
 tree with an explicit manifest to avoid upstream's Debian registry redirect.
 The [Homebrew formula](Formula/proxmox-backup-client.rb) contains the build recipe;
@@ -104,6 +107,35 @@ Three options of `backup` also exist only here:
   `skipped_placeholder_count`, `time_machine_excluded`, `warnings` and `duration`. On failure
   the record has `"ok": false` and the exit status is non-zero. The format is described in
   full at the top of `pbs-client/src/report.rs`.
+
+### Mounting an archive
+
+```sh
+proxmox-backup-client mount <snapshot> documents.pxar /some/empty/folder --ns laptops
+umount /some/empty/folder
+```
+
+`mount` shows an archive of a snapshot as a read-only folder. It needs FUSE-T on the Mac at
+run time. The command returns once the folder is mounted and leaves a background process
+that ends with the unmount; `--verbose` keeps it in the foreground. A failed mount exits
+non-zero. `--keyfd` is accepted, as on `backup`.
+
+- **With FUSE-T installed:** plain and split archives mount; names, contents, sizes, modes,
+  modification times and link targets match the source, and writing is refused.
+- **Without FUSE-T:** `mount` fails with
+  `FUSE is not available, FUSE-T (https://www.fuse-t.org) needs to be installed`. Every other
+  command works as before; the library is linked weakly.
+
+FUSE-T serves the folder over NFS, so a mount does not show extended attributes, resource
+forks, ACLs, BSD flags or creation dates, and names may come back in another Unicode
+normalization. Use `restore` or `catalog extract` to get files back with their Mac metadata.
+`map` and `unmap` (drive images of virtual machines) are not available on macOS.
+
+The mount code comes from the 3.2.4-based port
+([Marvo2011/proxmox-backup-client-mac](https://github.com/Marvo2011/proxmox-backup-client-mac)):
+a kqueue reactor and FUSE-T's buffer layout in `proxmox-fuse`
+(`scripts/macos/proxmox-fuse-darwin.patch`), and lookups of `.`, `..` and of names in another
+normalization in `pbs-pxar-fuse`.
 
 The CLI retains the Linux syntax, for example:
 

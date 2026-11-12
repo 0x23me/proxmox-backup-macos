@@ -12,6 +12,7 @@ patches = [
                  "proxmox-uuid-darwin.patch", "proxmox-sys-darwin-directories.patch", "proxmox-sys-mmap-alignment.patch")
 ] + [("pathpatterns", "5323cbe49ae5d592eb8a3fa2e215550e83dd7fba", "pathpatterns-darwin.patch")]
 patches += [("pxar", "091a8a382d0d6fc71025351fb35c51b1f3b0074d", "pxar-darwin.patch")]
+patches += [("proxmox-fuse", "ac99ac97f7c2eb7ab9ee6ec3b41034e68b1eca7d", "proxmox-fuse-darwin.patch")]
 pending = []
 for module, expected, name in patches:
     repository = root / "vendor" / module

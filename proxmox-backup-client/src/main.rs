@@ -34,12 +34,13 @@ use pbs_api_types::{
 };
 use pbs_client::catalog_shell::Shell;
 use pbs_client::pxar::{ErrorHandler as PxarErrorHandler, MetadataArchiveReader, PxarPrevRef};
+#[cfg(target_os = "linux")]
+use pbs_client::tools::complete_img_archive_name;
 use pbs_client::tools::{
     CHUNK_SIZE_SCHEMA, complete_archive_name, complete_auth_id, complete_backup_group,
     complete_backup_snapshot, complete_backup_source, complete_chunk_size,
-    complete_group_or_snapshot, complete_img_archive_name, complete_namespace,
-    complete_pxar_archive_name, complete_repository, connect, connect_rate_limited,
-    extract_repository_from_value,
+    complete_group_or_snapshot, complete_namespace, complete_pxar_archive_name,
+    complete_repository, connect, connect_rate_limited, extract_repository_from_value,
     key_source::{
         IGNORE_MISSING_SIGNATURE_SCHEMA, KEYFD_SCHEMA, KEYFILE_SCHEMA, MASTER_PUBKEY_FD_SCHEMA,
         MASTER_PUBKEY_FILE_SCHEMA, crypto_parameters, format_key_source,
@@ -80,9 +81,9 @@ pub use group::*;
 mod helper;
 pub(crate) use helper::*;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod mount;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use mount::*;
 
 mod snapshot;
@@ -2443,6 +2444,10 @@ fn main() {
         .insert("mount", mount_cmd_def())
         .insert("map", map_cmd_def())
         .insert("unmap", unmap_cmd_def());
+
+    // Needs FUSE-T at run time. Drive images cannot be mapped on macOS.
+    #[cfg(target_os = "macos")]
+    let cmd_def = cmd_def.insert("mount", mount_cmd_def());
 
     let rpcenv = CliEnvironment::new();
     run_cli_command(

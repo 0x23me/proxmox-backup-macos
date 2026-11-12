@@ -26,6 +26,9 @@ use proxmox_fuse::{EntryParam, Fuse, ROOT_ID, ReplyBufState, Request};
 use proxmox_lang::io_format_err;
 use proxmox_sys::fs::xattr;
 
+#[cfg(target_os = "macos")]
+mod macos;
+
 /// We mark inodes for regular files this way so we know how to access them.
 const NON_DIRECTORY_INODE: u64 = 1u64 << 63;
 
@@ -489,11 +492,26 @@ impl SessionImpl {
         parent: u64,
         file_name: &OsStr,
     ) -> Result<(EntryParam, LookupRef<'_>), Error> {
+        // not resolved in the kernel for every FUSE implementation, e.g. FUSE-T (NFS based)
+        if file_name == "." || file_name == ".." {
+            return self.lookup_dot(parent, file_name == "..").await;
+        }
+
         let dir = self.open_dir(parent).await?;
 
+        #[cfg(not(target_os = "macos"))]
         let entry = match { dir }.lookup(file_name).await? {
             Some(entry) => entry,
             None => io_return!(libc::ENOENT),
+        };
+
+        #[cfg(target_os = "macos")]
+        let entry = match dir.lookup(file_name).await? {
+            Some(entry) => entry,
+            None => match lookup_normalized(&dir, file_name).await? {
+                Some(entry) => entry,
+                None => io_return!(libc::ENOENT),
+            },
         };
 
         let entry = if let pxar::EntryKind::Hardlink(_) = entry.kind() {
@@ -514,6 +532,22 @@ impl SessionImpl {
         let response = to_entry(&entry)?;
         let inode = response.inode;
         Ok((response, self.make_lookup(parent, inode, &entry)?))
+    }
+
+    /// Look up "." or ".." in the directory `parent`.
+    async fn lookup_dot(
+        &'_ self,
+        parent: u64,
+        dotdot: bool,
+    ) -> Result<(EntryParam, LookupRef<'_>), Error> {
+        let inode = if dotdot {
+            self.get_lookup(parent)?.parent
+        } else {
+            parent
+        };
+        let lookup = self.get_lookup(inode)?;
+        let entry = self.open_dir(inode).await?.lookup_self().await?;
+        Ok((EntryParam::simple(inode, to_stat(inode, &entry)?), lookup))
     }
 
     async fn getattr(&self, inode: u64) -> Result<libc::stat, Error> {
@@ -666,6 +700,33 @@ impl SessionImpl {
     }
 }
 
+/// Look up a file name in `dir` ignoring differences in Unicode normalization.
+///
+/// macOS presents (and looks up) file names in decomposed form (NFD), while archives created on
+/// Linux usually contain composed (NFC) names.
+#[cfg(target_os = "macos")]
+async fn lookup_normalized(dir: &Directory, file_name: &OsStr) -> io::Result<Option<FileEntry>> {
+    let name = file_name.as_bytes();
+    // ASCII is the same in all normalization forms
+    if name.is_ascii() {
+        return Ok(None);
+    }
+    let wanted = match macos::normalize_nfd(name) {
+        Some(wanted) => wanted,
+        None => return Ok(None),
+    };
+
+    let mut iter = dir.read_dir();
+    while let Some(entry) = iter.next().await {
+        let entry = entry?;
+        let entry_name = entry.file_name().as_os_str().as_bytes();
+        if macos::normalize_nfd(entry_name).as_deref() == Some(&wanted[..]) {
+            return entry.decode_entry().await.map(Some);
+        }
+    }
+    Ok(None)
+}
+
 #[inline]
 fn to_entry(entry: &FileEntry) -> Result<EntryParam, Error> {
     to_entry_param(to_inode(entry), entry)
@@ -692,7 +753,7 @@ fn to_stat(inode: u64, entry: &pxar::Entry) -> Result<libc::stat, Error> {
     let mut stat: libc::stat = unsafe { mem::zeroed() };
     stat.st_ino = inode;
     stat.st_nlink = nlink;
-    stat.st_mode = u32::try_from(metadata.stat.mode)
+    stat.st_mode = libc::mode_t::try_from(metadata.stat.mode)
         .map_err(|err| format_err!("mode does not fit into st_mode field: {}", err))?;
     stat.st_size = i64::try_from(entry.file_size().unwrap_or(0))
         .map_err(|err| format_err!("size does not fit into st_size field: {}", err))?;
