@@ -354,7 +354,7 @@ def compare(a_root, b_root, ignore_xattrs=()):
 # --- self test -------------------------------------------------------------
 
 def selftest():
-    work = tempfile.mkdtemp(prefix="pbs-tm-roundtrip-")
+    work = tempfile.mkdtemp(prefix="pbs-client-roundtrip-")
     src, copy = os.path.join(work, "src"), os.path.join(work, "copy")
     failures = []
     try:
