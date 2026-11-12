@@ -56,6 +56,10 @@ libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
 XATTR_NOFOLLOW = 0x0001
 ACL_TYPE_EXTENDED = 0x00000100
 RESOURCE_FORK = "com.apple.ResourceFork"
+# Attributes macOS sets by itself: it tags what a process writes with the provenance of the app
+# that started it, depending on that app, and keeps its own access list. Neither is the client's
+# to restore, so a restored tree may differ from its source in them.
+SYSTEM_ATTRIBUTES = ("com.apple.provenance", "com.apple.macl")
 
 libc.listxattr.argtypes = [ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
 libc.listxattr.restype = ctypes.c_ssize_t
@@ -373,7 +377,7 @@ def selftest():
             age(target, birth=int(float(info["birthtime"])), mtime=int(float(info["mtime"])))
         age(copy)
         os.chflags(os.path.join(copy, "locked.txt"), stat.UF_IMMUTABLE)
-        diffs, count = compare(src, copy, ignore_xattrs=("com.apple.provenance",))
+        diffs, count = compare(src, copy, ignore_xattrs=SYSTEM_ATTRIBUTES)
         failures += [f"faithful copy reported: {d}" for d in diffs]
 
         # Each deliberate change must be reported.
@@ -396,7 +400,7 @@ def selftest():
         }
         for needle, change in changes.items():
             change()
-            diffs, _ = compare(src, copy, ignore_xattrs=("com.apple.provenance",))
+            diffs, _ = compare(src, copy, ignore_xattrs=SYSTEM_ATTRIBUTES)
             if not any(needle in d for d in diffs):
                 failures.append(f"change not detected: {needle}")
     finally:
@@ -473,7 +477,7 @@ def test_round_trip(server, work, state):
     snapshot, _ = server.backup("pbs-client-test-roundtrip", "fixture.pxar", src)
     state.update(src=src, snapshot=snapshot)
     server.run("restore", snapshot, "fixture.pxar", restored)
-    diffs, count = compare(src, restored)
+    diffs, count = compare(src, restored, SYSTEM_ATTRIBUTES)
     check(not diffs, f"{len(diffs)} differences after restore: " + "; ".join(diffs[:5]))
     return f"{count} entries identical after restore"
 
@@ -519,13 +523,14 @@ def test_catalog_extract(server, work, state):
     folder_target, file_target = os.path.join(work, "one-folder"), os.path.join(work, "one-file")
     server.run("catalog", "extract", snapshot, "fixture.pxar", "acl-dir", folder_target)
     check(os.listdir(folder_target) == ["acl-dir"], f"target holds {os.listdir(folder_target)}")
-    diffs, count = compare(os.path.join(src, "acl-dir"), os.path.join(folder_target, "acl-dir"))
+    diffs, count = compare(os.path.join(src, "acl-dir"), os.path.join(folder_target, "acl-dir"), SYSTEM_ATTRIBUTES)
     check(not diffs, "folder differs: " + "; ".join(diffs[:5]))
 
     server.run("catalog", "extract", snapshot, "fixture.pxar", "names/nfd", file_target)
     server.run("catalog", "extract", snapshot, "fixture.pxar", "downloaded.pdf", file_target)
     check(sorted(os.listdir(file_target)) == ["downloaded.pdf", "nfd"], f"target holds {os.listdir(file_target)}")
-    file_diffs, _ = compare(os.path.join(src, "downloaded.pdf"), os.path.join(file_target, "downloaded.pdf"))
+    file_diffs, _ = compare(os.path.join(src, "downloaded.pdf"), os.path.join(file_target, "downloaded.pdf"),
+                            SYSTEM_ATTRIBUTES)
     check(not file_diffs, "file differs: " + "; ".join(file_diffs[:5]))
 
     status, _, err = server.run("catalog", "extract", snapshot, "fixture.pxar", "nope", folder_target, ok=False)
