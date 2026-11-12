@@ -633,9 +633,11 @@ def test_placeholders(server, work, state):
     check(not {entry["name"] for entry in root} & set(dataless), "a placeholder is in the snapshot")
     still = [name for name in dataless if os.lstat(os.path.join(folder, name)).st_flags & 0x40000000]
     check(still == dataless, "the backup downloaded a placeholder")
+    time.sleep(1.1)   # not in the same second as the snapshot above
     status, _, err = server.run("backup", f"cloud.pxar:{folder}", "--backup-id",
                                 "pbs-client-test-placeholder", "--crypt-mode", "encrypt", ok=False)
-    check(status != 0 and "dataless" in err, "without the option the backup did not fail on the placeholder")
+    check(status != 0 and "dataless" in err,
+          f"without the option the backup exited {status}: {err.strip()[-200:]}")
     return f"{len(dataless)} placeholder(s) left out, named, not downloaded"
 
 
