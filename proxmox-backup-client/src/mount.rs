@@ -1,7 +1,5 @@
-#[cfg(target_os = "linux")]
 use std::collections::HashMap;
 use std::ffi::OsStr;
-#[cfg(target_os = "linux")]
 use std::hash::BuildHasher;
 use std::os::unix::io::{AsRawFd, OwnedFd};
 use std::path::Path;
@@ -10,7 +8,6 @@ use std::sync::Arc;
 use anyhow::{Error, bail, format_err};
 use futures::future::FutureExt;
 use futures::select;
-#[cfg(target_os = "linux")]
 use futures::stream::{StreamExt, TryStreamExt};
 use nix::unistd::{ForkResult, fork};
 use serde_json::Value;
@@ -22,27 +19,21 @@ use proxmox_sortable_macro::sortable;
 
 use pbs_api_types::{ArchiveType, BackupArchiveName};
 use pbs_client::tools::key_source::{
-    IGNORE_MISSING_SIGNATURE_SCHEMA, KEYFD_SCHEMA, crypto_parameters, format_key_source,
+    IGNORE_MISSING_SIGNATURE_SCHEMA, crypto_parameters, format_key_source,
     get_encryption_key_password,
 };
-#[cfg(target_os = "linux")]
-use pbs_client::RemoteChunkReader;
-use pbs_client::{BackupReader, BackupTargetArgs};
-#[cfg(target_os = "linux")]
+use pbs_client::{BackupReader, BackupTargetArgs, RemoteChunkReader};
 use pbs_datastore::cached_chunk_reader::CachedChunkReader;
-#[cfg(target_os = "linux")]
 use pbs_datastore::index::IndexFile;
 use pbs_key_config::decrypt_key;
 use pbs_tools::crypt_config::CryptConfig;
 use pbs_tools::json::required_string_param;
 
 use crate::helper;
-#[cfg(target_os = "linux")]
-use crate::complete_img_archive_name;
 use crate::{
-    complete_group_or_snapshot, complete_namespace, complete_pxar_archive_name,
-    complete_repository, connect, dir_or_last_from_group, extract_repository_from_value,
-    optional_ns_param, record_repository,
+    complete_group_or_snapshot, complete_img_archive_name, complete_namespace,
+    complete_pxar_archive_name, complete_repository, connect, dir_or_last_from_group,
+    extract_repository_from_value, optional_ns_param, record_repository,
 };
 
 #[sortable]
@@ -65,7 +56,6 @@ const API_METHOD_MOUNT: ApiMethod = ApiMethod::new_full(
                         false,
                         &StringSchema::new("Target directory path.").schema()
                     ),
-                    ("keyfd", true, &KEYFD_SCHEMA),
                     (
                         "keyfile",
                         true,
@@ -91,7 +81,6 @@ const API_METHOD_MOUNT: ApiMethod = ApiMethod::new_full(
     )),
 );
 
-#[cfg(target_os = "linux")]
 #[sortable]
 const API_METHOD_MAP: ApiMethod = ApiMethod::new_full(
     &ApiHandler::Sync(&mount),
@@ -133,7 +122,6 @@ const API_METHOD_MAP: ApiMethod = ApiMethod::new_full(
     )),
 );
 
-#[cfg(target_os = "linux")]
 #[sortable]
 const API_METHOD_UNMAP: ApiMethod = ApiMethod::new(
     &ApiHandler::Sync(&unmap),
@@ -161,7 +149,6 @@ pub fn mount_cmd_def() -> CliCommand {
         .completion_cb("target", complete_file_name)
 }
 
-#[cfg(target_os = "linux")]
 pub fn map_cmd_def() -> CliCommand {
     CliCommand::new(&API_METHOD_MAP)
         .arg_param(&["snapshot", "archive-name"])
@@ -171,14 +158,12 @@ pub fn map_cmd_def() -> CliCommand {
         .completion_cb("archive-name", complete_img_archive_name)
 }
 
-#[cfg(target_os = "linux")]
 pub fn unmap_cmd_def() -> CliCommand {
     CliCommand::new(&API_METHOD_UNMAP)
         .arg_param(&["name"])
         .completion_cb("name", complete_mapping_names)
 }
 
-#[cfg(target_os = "linux")]
 fn complete_mapping_names<S: BuildHasher>(
     _arg: &str,
     _param: &HashMap<String, String, S>,
@@ -217,13 +202,8 @@ fn mount(
             // descriptor has probably been closed. This means that there was an error in the child
             // process and it did not daemonize correctly.
             if buffer[0] == 0 {
-                // Wait for the child process to finish, so it can return a nice error, and
-                // pass its failure on: the caller must be able to tell that nothing is mounted.
-                match nix::sys::wait::wait().unwrap() {
-                    nix::sys::wait::WaitStatus::Exited(_, 0) => {}
-                    nix::sys::wait::WaitStatus::Exited(_, code) => std::process::exit(code),
-                    _ => std::process::exit(1),
-                }
+                // Wait for the child process to finish, so it can return a nice error.
+                nix::sys::wait::wait().unwrap();
             }
 
             Ok(Value::Null)
@@ -252,22 +232,6 @@ async fn mount_do(param: Value, pipe: Option<OwnedFd>) -> Result<Value, Error> {
     let backup_dir = dir_or_last_from_group(&client, &repo, &backup_ns, path).await?;
 
     let crypto = crypto_parameters(&param)?;
-
-    // With `--keyfd 0` standard input is closed once the key is read. Keep the descriptors 0 to 2
-    // occupied: the FUSE session would otherwise get one of them and lose it when they are
-    // pointed at /dev/null to detach from the terminal.
-    for fd in 0..=2 {
-        if nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_GETFD).is_err() {
-            let opened = nix::fcntl::open(
-                "/dev/null",
-                nix::fcntl::OFlag::O_RDWR,
-                nix::sys::stat::Mode::empty(),
-            )?;
-            if opened != fd {
-                bail!("could not reopen file descriptor {fd}");
-            }
-        }
-    }
 
     let crypt_config = match crypto.enc_key {
         None => None,
@@ -349,120 +313,80 @@ async fn mount_do(param: Value, pipe: Option<OwnedFd>) -> Result<Value, Error> {
         )
         .await?;
 
-        #[cfg(target_os = "macos")]
-        let device = |path: &Path| nix::sys::stat::stat(path).map(|stat| stat.st_dev);
-        #[cfg(target_os = "macos")]
-        let device_before = device(Path::new(target.unwrap()))?;
-
         let session =
             pbs_pxar_fuse::Session::mount(decoder, options, false, Path::new(target.unwrap()))
                 .map_err(|err| format_err!("pxar mount failed: {}", err))?;
-        let mut session = session.fuse();
-
-        // FUSE-T mounts through NFS, and the mount only shows up once requests are being served.
-        // Wait for it before telling the parent process that the archive is mounted.
-        #[cfg(target_os = "macos")]
-        {
-            let target = std::path::PathBuf::from(target.unwrap());
-            let mut appeared = tokio::task::spawn_blocking(move || {
-                for _ in 0..300 {
-                    if device(&target).is_ok_and(|now| now != device_before) {
-                        return true;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                }
-                false
-            })
-            .fuse();
-            select! {
-                res = session => {
-                    res?;
-                    bail!("the FUSE session ended before the archive was mounted");
-                }
-                mounted = appeared => {
-                    if !mounted.unwrap_or(false) {
-                        bail!("the mount did not appear within 30 seconds");
-                    }
-                }
-                _ = interrupt => return Ok(Value::Null),
-            }
-        }
 
         daemonize()?;
 
         select! {
-            res = session => res?,
+            res = session.fuse() => res?,
             _ = interrupt => {
                 // exit on interrupted
             }
         }
     } else if server_archive_name.archive_type() == ArchiveType::FixedIndex {
-        #[cfg(not(target_os = "linux"))]
-        bail!("mapping drive images is only supported on Linux");
-        #[cfg(target_os = "linux")]
-        {
-            let file_info = manifest.lookup_file_info(&server_archive_name)?;
-            let index = client
-                .download_fixed_index(&manifest, &server_archive_name)
-                .await?;
-            let size = index.index_bytes();
-            let chunk_reader = RemoteChunkReader::new(
-                client.clone(),
-                crypt_config,
-                file_info.chunk_crypt_mode(),
-                HashMap::new(),
-            );
-            let reader = CachedChunkReader::new(chunk_reader, index, 8).seekable();
+        let file_info = manifest.lookup_file_info(&server_archive_name)?;
+        let index = client
+            .download_fixed_index(&manifest, &server_archive_name)
+            .await?;
+        let size = index.index_bytes();
+        let chunk_reader = RemoteChunkReader::new(
+            client.clone(),
+            crypt_config,
+            file_info.chunk_crypt_mode(),
+            HashMap::new(),
+        );
+        let reader = CachedChunkReader::new(chunk_reader, index, 8).seekable();
 
-            let name = &format!(
-                "{repo}:{path}/{}",
-                server_archive_name.without_type_extension(),
-            );
-            let name_escaped = proxmox_systemd::escape_unit(name, false);
+        let name = &format!(
+            "{repo}:{path}/{}",
+            server_archive_name.without_type_extension(),
+        );
+        let name_escaped = proxmox_systemd::escape_unit(name, false);
 
-            let mut session =
-                pbs_fuse_loop::FuseLoopSession::map_loop(size, reader, &name_escaped, options).await?;
-            let loopdev = session.loopdev_path.clone();
+        let mut session =
+            pbs_fuse_loop::FuseLoopSession::map_loop(size, reader, &name_escaped, options).await?;
+        let loopdev = session.loopdev_path.clone();
 
-            let (st_send, st_recv) = futures::channel::mpsc::channel(1);
-            let (mut abort_send, abort_recv) = futures::channel::mpsc::channel(1);
-            let mut st_recv = st_recv.fuse();
-            let mut session_fut = session.main(st_send, abort_recv).boxed().fuse();
+        let (st_send, st_recv) = futures::channel::mpsc::channel(1);
+        let (mut abort_send, abort_recv) = futures::channel::mpsc::channel(1);
+        let mut st_recv = st_recv.fuse();
+        let mut session_fut = session.main(st_send, abort_recv).boxed().fuse();
 
-            // poll until loop file is mapped (or errors)
-            select! {
-                _res = session_fut => {
-                    bail!("FUSE session unexpectedly ended before loop file mapping");
-                },
-                res = st_recv.try_next() => {
-                    if let Err(err) = res {
-                        // init went wrong, abort now
-                        abort_send.try_send(()).map_err(|err|
-                            format_err!("error while sending abort signal - {}", err))?;
-                        // ignore and keep original error cause
-                        let _ = session_fut.await;
-                        return Err(err);
-                    }
-                }
-            }
-
-            // daemonize only now to be able to print mapped loopdev or startup errors
-            log::info!("Image '{}' mapped on {}", name, loopdev);
-            daemonize()?;
-
-            // continue polling until complete or interrupted (which also happens on unmap)
-            select! {
-                res = session_fut => res?,
-                _ = interrupt => {
-                    // exit on interrupted
+        // poll until loop file is mapped (or errors)
+        select! {
+            _res = session_fut => {
+                bail!("FUSE session unexpectedly ended before loop file mapping");
+            },
+            res = st_recv.try_next() => {
+                if let Err(err) = res {
+                    // init went wrong, abort now
                     abort_send.try_send(()).map_err(|err|
                         format_err!("error while sending abort signal - {}", err))?;
-                    session_fut.await?;
+                    // ignore and keep original error cause
+                    let _ = session_fut.await;
+                    return Err(err);
                 }
             }
-
-            log::info!("Image unmapped");
         }
+
+        // daemonize only now to be able to print mapped loopdev or startup errors
+        log::info!("Image '{}' mapped on {}", name, loopdev);
+        daemonize()?;
+
+        // continue polling until complete or interrupted (which also happens on unmap)
+        select! {
+            res = session_fut => res?,
+            _ = interrupt => {
+                // exit on interrupted
+                abort_send.try_send(()).map_err(|err|
+                    format_err!("error while sending abort signal - {}", err))?;
+                session_fut.await?;
+            }
+        }
+
+        log::info!("Image unmapped");
     } else {
         bail!("unknown archive file extension (expected .pxar or .img)");
     }
@@ -470,7 +394,6 @@ async fn mount_do(param: Value, pipe: Option<OwnedFd>) -> Result<Value, Error> {
     Ok(Value::Null)
 }
 
-#[cfg(target_os = "linux")]
 fn unmap(
     param: Value,
     _info: &ApiMethod,

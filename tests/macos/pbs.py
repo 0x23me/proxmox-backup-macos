@@ -27,12 +27,6 @@ What is tested:
                      backup still succeeds
   placeholders       --skip-placeholders leaves out files whose contents are not on disk and
                      names them; without it the backup fails (needs PBS_TEST_PLACEHOLDER_DIR)
-  mount              a plain and a split archive are mounted read-only through FUSE-T and
-                     compared with the source: names, contents, sizes, modes, modification
-                     times, link targets; writing is refused; unmounting ends the client
-                     (skipped when FUSE-T is not installed)
-  without FUSE-T     a copy of the client that cannot find FUSE-T's library still starts and
-                     lists a snapshot; its mount fails and names FUSE-T
 
 Environment:
   PBS_REPOSITORY             as for the client (required)
@@ -867,89 +861,6 @@ def test_placeholders(server, work, state):
     return f"{len(dataless)} placeholder(s) left out, named, not downloaded"
 
 
-FUSE_T_LIBRARY = "/usr/local/lib/libfuse3.dylib"
-
-
-def mounted_view(root):
-    """What a mount shows of every entry below root. Names are compared composed, because the
-    mount goes through NFS and macOS may hand names back in another normalization."""
-    seen = {}
-    for folder, folders, files in os.walk(root):
-        for name in folders + files:
-            path = os.path.join(folder, name)
-            info = os.lstat(path)
-            rel = unicodedata.normalize("NFC", os.path.relpath(path, root))
-            if stat.S_ISLNK(info.st_mode):
-                seen[rel] = ("link", os.readlink(path))
-            elif stat.S_ISDIR(info.st_mode):
-                seen[rel] = ("folder", int(info.st_mtime))
-            else:
-                seen[rel] = ("file", sha256_file(path), info.st_size, stat.S_IMODE(info.st_mode), int(info.st_mtime))
-    return seen
-
-
-def is_mounted(path):
-    return os.stat(path).st_dev != os.stat(os.path.dirname(path)).st_dev
-
-
-def test_mount(server, work, state):
-    if not os.path.exists(FUSE_T_LIBRARY):
-        return "SKIPPED (FUSE-T is not installed)"
-    src = state["src"]
-    split, _ = server.backup("pbs-client-test-roundtrip", "fixture.pxar", src, "--change-detection-mode=metadata")
-    expected = mounted_view(src)
-    for kind, snapshot in (("plain", state["snapshot"]), ("split", split)):
-        target = os.path.join(work, f"mounted-{kind}")
-        os.mkdir(target)
-        server.run("mount", snapshot, "fixture.pxar", target)
-        try:
-            check(is_mounted(target), f"{kind}: mount returned but nothing is mounted")
-            shown = mounted_view(target)
-            wrong = sorted(name for name in set(expected) | set(shown) if expected.get(name) != shown.get(name))
-            check(not wrong, f"{kind}: {len(wrong)} entries differ from the source: " + "; ".join(wrong[:5]))
-            try:
-                write(os.path.join(target, "new-file"), b"x")
-                raise Failed(f"{kind}: a file could be created in the mount")
-            except OSError:
-                pass
-        finally:
-            subprocess.run(["/sbin/umount", target], capture_output=True)
-        for _ in range(50):
-            running = subprocess.run(["/usr/bin/pgrep", "-f", f"proxmox-backup-client mount .* {target}"],
-                                     capture_output=True).returncode == 0
-            if not running and not is_mounted(target):
-                break
-            time.sleep(0.1)
-        check(not running, f"{kind}: the client kept running after the unmount")
-    status, _, err = server.run("mount", "host/pbs-client-test-roundtrip/2001-01-01T00:00:00Z", "fixture.pxar",
-                                target, ok=False)
-    check(status != 0, "mounting a snapshot that does not exist reported success")
-    return f"plain and split archive mounted, {len(expected)} entries each identical to the source, read-only"
-
-
-def test_without_fuse_t(server, work, state):
-    """Points a copy of the client at a library path that does not exist, which is what the
-    client finds on a Mac without FUSE-T."""
-    copy = os.path.join(work, "client-without-fuse-t")
-    shutil.copy(server.client, copy)
-    subprocess.run(["/usr/bin/install_name_tool", "-change", "@rpath/libfuse3.4.dylib",
-                    "/nonexistent/libfuse3.4.dylib", copy], check=True, capture_output=True)
-    subprocess.run(["/usr/bin/codesign", "--force", "--sign", "-", copy], check=True, capture_output=True)
-    target = os.path.join(work, "not-mounted")
-    os.mkdir(target)
-    original, server.client = server.client, copy
-    try:
-        _, entries, _ = server.listing(state["snapshot"], "fixture.pxar")
-        check(entries, "the client without FUSE-T did not list the snapshot")
-        status, _, err = server.run("mount", state["snapshot"], "fixture.pxar", target, ok=False)
-    finally:
-        server.client = original
-    check(status != 0, "mount without FUSE-T reported success")
-    check("FUSE-T" in err, f"mount without FUSE-T does not name it: {err.strip()[-200:]}")
-    check(not is_mounted(target), "something is mounted")
-    return "listing works; mount fails and names FUSE-T"
-
-
 def run_all():
     work = tempfile.mkdtemp(prefix="pbs-client-test-")
     failed = 0
@@ -958,7 +869,7 @@ def run_all():
         state = {}
         for test in (test_round_trip, test_catalog_list, test_catalog_extract, test_change_detection,
                      test_changed_dirs, test_progress_records, test_time_machine_exclusions, test_unreadable_files,
-                     test_placeholders, test_mount, test_without_fuse_t):
+                     test_placeholders):
             name = test.__name__[5:].replace("_", " ")
             try:
                 outcome = test(server, work, state)

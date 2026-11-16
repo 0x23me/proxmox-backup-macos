@@ -46,5 +46,4 @@ pbs-pxar-fuse.workspace = true
 proxmox-systemd.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
-pbs-pxar-fuse.workspace = true
 tempfile.workspace = true
